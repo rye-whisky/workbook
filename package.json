@@ -1,0 +1,26 @@
+{
+  "name": "workbook",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Teacher-facing voice homework collection PWA.",
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @workbook/api --filter @workbook/web dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @workbook/api start",
+    "test": "pnpm -r test",
+    "db:generate": "pnpm --filter @workbook/api db:generate",
+    "db:migrate": "pnpm --filter @workbook/api db:migrate",
+    "db:studio": "pnpm --filter @workbook/api db:studio"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "tesseract.js"
+    ]
+  }
+}

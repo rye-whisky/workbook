@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Workbook">
+  <rect width="512" height="512" rx="112" fill="#2f5f4f"/>
+  <path d="M144 112h170c35.346 0 64 28.654 64 64v224H195c-28.167 0-51-22.833-51-51V112Z" fill="#f7f2e8"/>
+  <path d="M198 182h120M198 246h120M198 310h80" stroke="#2f5f4f" stroke-width="26" stroke-linecap="round"/>
+  <circle cx="365" cy="348" r="45" fill="#d96846"/>
+</svg>

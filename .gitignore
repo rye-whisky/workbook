@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+.vite/
+coverage/
+
+# local env and secrets
+.env
+.env.*
+!.env.example
+
+# runtime data
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+uploads/
+logs/
+*.log
+*.tsbuildinfo
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

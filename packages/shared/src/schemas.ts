@@ -1,0 +1,67 @@
+import { z } from "zod";
+
+export const teacherRegisterSchema = z.object({
+  name: z.string().trim().min(2, "请输入教师姓名"),
+  username: z.string().trim().min(3, "账号至少 3 个字符"),
+  password: z.string().min(6, "密码至少 6 位"),
+  subjectName: z.string().trim().min(1, "请选择或填写学科"),
+  gradeName: z.string().trim().min(1, "请填写默认年级"),
+  className: z.string().trim().min(1, "请填写默认班级")
+});
+
+export const loginSchema = z.object({
+  username: z.string().trim().min(1),
+  password: z.string().min(1)
+});
+
+export const namedEntitySchema = z.object({
+  name: z.string().trim().min(1)
+});
+
+export const classSchema = z.object({
+  name: z.string().trim().min(1),
+  gradeId: z.string().min(1)
+});
+
+export const studentSchema = z.object({
+  name: z.string().trim().min(1),
+  studentNo: z.string().trim().optional().nullable(),
+  aliases: z.array(z.string().trim()).optional().default([]),
+  gradeId: z.string().min(1),
+  classId: z.string().min(1)
+});
+
+export const homeworkTaskSchema = z.object({
+  title: z.string().trim().min(1),
+  subjectId: z.string().min(1),
+  gradeId: z.string().min(1),
+  classId: z.string().min(1),
+  dueDate: z.string().trim().min(1),
+  status: z.enum(["draft", "active", "closed"]).default("active")
+});
+
+export const submissionStatusSchema = z.object({
+  status: z.enum(["submitted", "missing", "pending_confirm"]),
+  source: z.string().trim().optional().default("manual")
+});
+
+export const voiceMatchSchema = z.object({
+  text: z.string().trim().min(1)
+});
+
+export const importCommitSchema = z.object({
+  gradeId: z.string().min(1),
+  classId: z.string().min(1),
+  rows: z.array(
+    z.object({
+      name: z.string().trim().min(1),
+      studentNo: z.string().trim().optional().nullable(),
+      aliases: z.array(z.string().trim()).optional().default([])
+    })
+  ),
+  duplicateStrategy: z.enum(["skip", "overwrite"]).default("skip")
+});
+
+export type TeacherRegisterInput = z.infer<typeof teacherRegisterSchema>;
+export type LoginInput = z.infer<typeof loginSchema>;
+export type HomeworkTaskInput = z.infer<typeof homeworkTaskSchema>;
