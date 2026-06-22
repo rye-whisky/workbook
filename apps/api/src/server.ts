@@ -42,6 +42,9 @@ const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 const sessionSecret = process.env.SESSION_SECRET ?? "dev-only-change-me";
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "uploads");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const secureCookies = process.env.COOKIE_SECURE
+  ? process.env.COOKIE_SECURE === "true"
+  : webOrigin.startsWith("https://");
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -77,7 +80,7 @@ function setSessionCookie(res: Response, token: string) {
   res.cookie("workbook_session", token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: secureCookies,
     maxAge: 14 * 24 * 60 * 60 * 1000
   });
 }
