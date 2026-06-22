@@ -391,7 +391,12 @@ function AuthScreen(props: {
       }
       await props.onAuthed();
     } catch (error) {
-      props.setMessage(error instanceof Error ? error.message : "登录失败");
+      const rawMessage = error instanceof Error ? error.message : "登录失败";
+      const friendlyMessage =
+        mode === "register" && rawMessage.includes("数据已存在")
+          ? "账号已存在，请切换到登录，或换一个登录账号重新注册。"
+          : rawMessage;
+      props.setMessage(friendlyMessage);
     } finally {
       props.setBusy(false);
     }

@@ -85,7 +85,7 @@ function setSessionCookie(res: Response, token: string) {
 function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   const token = req.cookies?.workbook_session;
   if (!token) {
-    return fail(res, 401, "璇峰厛鐧诲綍");
+    return fail(res, 401, "请先登录");
   }
   try {
     const payload = jwt.verify(token, sessionSecret) as { teacherId?: string };
@@ -272,7 +272,7 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
     currentTeacherId
   );
   if (!row) {
-    throw new Error("浣滀笟浠诲姟涓嶅瓨鍦ㄦ垨鏃犳潈璁块棶");
+    throw new Error("作业任务不存在或无权访问");
   }
   return camelTask(row);
 }
@@ -280,16 +280,16 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
 function ensureClass(currentTeacherId: string, gradeId: string, classId: string) {
   const classroom = one("SELECT id FROM classrooms WHERE id = ? AND grade_id = ? AND teacher_id = ?", classId, gradeId, currentTeacherId);
   if (!classroom) {
-    throw new Error("鐝骇涓嶅瓨鍦ㄦ垨鏃犳潈璁块棶");
+    throw new Error("班级不存在或无权访问");
   }
 }
 
 function normalizeRosterRow(row: Record<string, unknown>) {
-  const name = String(row["濮撳悕"] ?? row["瀛︾敓濮撳悕"] ?? row.name ?? row.Name ?? "").trim();
-  const studentNo = String(row["瀛﹀彿"] ?? row["搴忓彿"] ?? row.studentNo ?? row.no ?? "").trim() || null;
-  const aliasesText = String(row["鍒悕"] ?? row.aliases ?? "").trim();
+  const name = String(row["姓名"] ?? row["学生姓名"] ?? row.name ?? row.Name ?? "").trim();
+  const studentNo = String(row["学号"] ?? row["序号"] ?? row.studentNo ?? row.no ?? "").trim() || null;
+  const aliasesText = String(row["别名"] ?? row.aliases ?? "").trim();
   const aliases = aliasesText
-    ? aliasesText.split(/[銆?锛?]/).map((item) => item.trim()).filter(Boolean)
+    ? aliasesText.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean)
     : [];
   return name ? { name, studentNo, aliases } : null;
 }
@@ -323,14 +323,14 @@ app.post("/api/auth/register", async (req, res, next) => {
         run("INSERT OR IGNORE INTO grades (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, id, timestamp, timestamp);
       }
       const grade = one("SELECT id FROM grades WHERE teacher_id = ? AND name = ?", id, input.gradeName);
-      if (!grade) throw new Error("榛樿骞寸骇鍒涘缓澶辫触");
+      if (!grade) throw new Error("默认年级创建失败");
       run("INSERT INTO classrooms (id, name, teacher_id, grade_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", createId(), input.className, id, String(grade.id), timestamp, timestamp);
       for (const name of new Set([...DEFAULT_SUBJECTS, input.subjectName])) {
         run("INSERT OR IGNORE INTO subjects (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, id, timestamp, timestamp);
       }
       return one("SELECT id, username, name FROM teachers WHERE id = ?", id);
     });
-    if (!created) throw new Error("璐﹀彿鍒涘缓澶辫触");
+    if (!created) throw new Error("账号创建失败");
     setSessionCookie(res, signSession(String(created.id)));
     return ok(res, camelTeacher(created));
   } catch (error) {
@@ -414,7 +414,7 @@ app.post("/api/classes", requireAuth, (req: AuthRequest, res, next) => {
     const input = classSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     if (!one("SELECT id FROM grades WHERE id = ? AND teacher_id = ?", input.gradeId, currentTeacherId)) {
-      throw new Error("骞寸骇涓嶅瓨鍦ㄦ垨鏃犳潈璁块棶");
+      throw new Error("年级不存在或无权访问");
     }
     const id = createId();
     const timestamp = nowIso();
@@ -505,7 +505,7 @@ app.post("/api/homework-tasks", requireAuth, (req: AuthRequest, res, next) => {
     const currentTeacherId = teacherId(req);
     ensureClass(currentTeacherId, input.gradeId, input.classId);
     if (!one("SELECT id FROM subjects WHERE id = ? AND teacher_id = ?", input.subjectId, currentTeacherId)) {
-      throw new Error("瀛︾涓嶅瓨鍦ㄦ垨鏃犳潈璁块棶");
+      throw new Error("学科不存在或无权访问");
     }
     const taskId = withTransaction(() => {
       const id = createId();
@@ -557,7 +557,7 @@ app.patch("/api/homework-tasks/:id/submissions/:studentId", requireAuth, (req: A
     const input = submissionStatusSchema.parse(req.body);
     const task = getTaskForTeacher(routeParam(req, "id"), teacherId(req));
     const student = task.submissions.find((submission) => submission.student.id === routeParam(req, "studentId"));
-    if (!student) throw new Error("瀛︾敓涓嶅湪璇ヤ綔涓氫换鍔′腑");
+    if (!student) throw new Error("学生不在该作业任务中");
     run("UPDATE homework_submissions SET status = ?, source = ?, updated_at = ? WHERE task_id = ? AND student_id = ?", input.status, input.source, nowIso(), routeParam(req, "id"), routeParam(req, "studentId"));
     return ok(res, getSubmissions(routeParam(req, "id")).find((submission) => submission.student.id === routeParam(req, "studentId")));
   } catch (error) {
@@ -587,7 +587,7 @@ app.post("/api/homework-tasks/:id/voice-matches", requireAuth, (req: AuthRequest
 
 app.post("/api/imports/roster-file", requireAuth, upload.single("file"), async (req: AuthRequest, res, next) => {
   try {
-    if (!req.file) return fail(res, 400, "璇蜂笂浼犺姳鍚嶅唽鏂囦欢");
+    if (!req.file) return fail(res, 400, "请上传花名册文件");
     const buffer = await fs.promises.readFile(req.file.path);
     const rows = parseRosterBuffer(buffer);
     await fs.promises.unlink(req.file.path).catch(() => undefined);
@@ -602,7 +602,7 @@ app.post("/api/imports/roster-file", requireAuth, upload.single("file"), async (
 
 app.post("/api/imports/roster-ocr", requireAuth, upload.single("file"), async (req: AuthRequest, res, next) => {
   try {
-    if (!req.file) return fail(res, 400, "璇蜂笂浼犺姳鍚嶅唽鍥剧墖");
+    if (!req.file) return fail(res, 400, "请上传花名册图片");
     const worker = await createWorker("chi_sim+eng");
     const result = await worker.recognize(req.file.path);
     await worker.terminate();
@@ -632,7 +632,7 @@ app.post("/api/imports/:id/commit", requireAuth, (req: AuthRequest, res, next) =
     const currentTeacherId = teacherId(req);
     ensureClass(currentTeacherId, input.gradeId, input.classId);
     if (!one("SELECT id FROM import_batches WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), currentTeacherId)) {
-      throw new Error("瀵煎叆鎵规涓嶅瓨鍦ㄦ垨鏃犳潈璁块棶");
+      throw new Error("导入批次不存在或无权访问");
     }
     let created = 0;
     let skipped = 0;
@@ -665,8 +665,10 @@ app.use((error: unknown, _req: Request, res: Response<ApiEnvelope<never>>, _next
     return fail(res, 400, error.issues[0]?.message ?? "Invalid request data");
   }
   if (error instanceof Error) {
-    const message = /UNIQUE constraint failed/.test(error.message) ? "鏁版嵁宸插瓨鍦紝璇锋鏌ラ噸澶嶉」" : error.message;
-    return fail(res, 500, message);
+    if (/UNIQUE constraint failed/.test(error.message)) {
+      return fail(res, 409, "数据已存在，请检查账号、班级、学生或学科是否重复");
+    }
+    return fail(res, 500, error.message);
   }
   return fail(res, 500, "Server error");
 });
