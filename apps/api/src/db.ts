@@ -13,6 +13,19 @@ export const db = new DatabaseSync(resolvedDbPath);
 db.exec("PRAGMA foreign_keys = ON");
 db.exec("PRAGMA journal_mode = WAL");
 
+function hasColumn(table: string, column: string) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((row) => {
+    const item = row as { name?: unknown };
+    return item.name === column;
+  });
+}
+
+function ensureColumn(table: string, column: string, definition: string) {
+  if (!hasColumn(table, column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
 export function createId() {
   return randomUUID();
 }
@@ -38,6 +51,7 @@ export function migrate() {
       teacher_id TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      deleted_at TEXT,
       UNIQUE (teacher_id, name),
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
     );
@@ -49,6 +63,7 @@ export function migrate() {
       grade_id TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      deleted_at TEXT,
       UNIQUE (teacher_id, grade_id, name),
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
       FOREIGN KEY (grade_id) REFERENCES grades(id) ON DELETE CASCADE
@@ -62,8 +77,10 @@ export function migrate() {
       teacher_id TEXT NOT NULL,
       grade_id TEXT NOT NULL,
       class_id TEXT NOT NULL,
+      display_order INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      deleted_at TEXT,
       UNIQUE (teacher_id, class_id, name),
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
       FOREIGN KEY (grade_id) REFERENCES grades(id) ON DELETE CASCADE,
@@ -89,6 +106,9 @@ export function migrate() {
       subject_id TEXT NOT NULL,
       grade_id TEXT NOT NULL,
       class_id TEXT NOT NULL,
+      grade_name_snapshot TEXT,
+      class_name_snapshot TEXT,
+      subject_name_snapshot TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
@@ -104,6 +124,7 @@ export function migrate() {
       status TEXT NOT NULL DEFAULT 'missing',
       source TEXT NOT NULL DEFAULT 'system',
       raw_text TEXT,
+      student_name_snapshot TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE (task_id, student_id),
@@ -122,6 +143,29 @@ export function migrate() {
       updated_at TEXT NOT NULL,
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
     );
+  `);
+
+  ensureColumn("grades", "deleted_at", "TEXT");
+  ensureColumn("classrooms", "deleted_at", "TEXT");
+  ensureColumn("students", "display_order", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("students", "deleted_at", "TEXT");
+  ensureColumn("homework_tasks", "grade_name_snapshot", "TEXT");
+  ensureColumn("homework_tasks", "class_name_snapshot", "TEXT");
+  ensureColumn("homework_tasks", "subject_name_snapshot", "TEXT");
+  ensureColumn("homework_submissions", "student_name_snapshot", "TEXT");
+
+  db.exec(`
+    UPDATE homework_tasks
+    SET grade_name_snapshot = COALESCE(grade_name_snapshot, (SELECT name FROM grades WHERE grades.id = homework_tasks.grade_id)),
+        class_name_snapshot = COALESCE(class_name_snapshot, (SELECT name FROM classrooms WHERE classrooms.id = homework_tasks.class_id)),
+        subject_name_snapshot = COALESCE(subject_name_snapshot, (SELECT name FROM subjects WHERE subjects.id = homework_tasks.subject_id))
+    WHERE grade_name_snapshot IS NULL
+       OR class_name_snapshot IS NULL
+       OR subject_name_snapshot IS NULL;
+
+    UPDATE homework_submissions
+    SET student_name_snapshot = COALESCE(student_name_snapshot, (SELECT name FROM students WHERE students.id = homework_submissions.student_id))
+    WHERE student_name_snapshot IS NULL;
   `);
 }
 

@@ -4,9 +4,7 @@ export const teacherRegisterSchema = z.object({
   name: z.string().trim().min(2, "请输入教师姓名"),
   username: z.string().trim().min(3, "账号至少 3 个字符"),
   password: z.string().min(6, "密码至少 6 位"),
-  subjectName: z.string().trim().min(1, "请选择或填写学科"),
-  gradeName: z.string().trim().min(1, "请填写默认年级"),
-  className: z.string().trim().min(1, "请填写默认班级")
+  subjectName: z.string().trim().min(1, "请选择或填写学科")
 });
 
 export const loginSchema = z.object({
@@ -28,7 +26,12 @@ export const studentSchema = z.object({
   studentNo: z.string().trim().optional().nullable(),
   aliases: z.array(z.string().trim()).optional().default([]),
   gradeId: z.string().min(1),
-  classId: z.string().min(1)
+  classId: z.string().min(1),
+  displayOrder: z.number().int().nonnegative().optional()
+});
+
+export const studentOrderSchema = z.object({
+  studentIds: z.array(z.string().min(1)).min(1)
 });
 
 export const homeworkTaskSchema = z.object({

@@ -1,5 +1,7 @@
 import {
   BookOpenCheck,
+  ArrowDown,
+  ArrowUp,
   Check,
   ClipboardList,
   FileSpreadsheet,
@@ -53,6 +55,7 @@ interface Student {
   aliases: string[];
   gradeId: string;
   classId: string;
+  displayOrder: number;
   grade?: Grade;
   classroom?: Classroom;
 }
@@ -110,17 +113,12 @@ const DEFAULT_REGISTER: {
   username: string;
   password: string;
   subjectName: string;
-  gradeName: string;
-  className: string;
 } = {
   name: "",
   username: "",
   password: "",
-  subjectName: DEFAULT_SUBJECTS[0],
-  gradeName: "七年级",
-  className: "1班"
+  subjectName: DEFAULT_SUBJECTS[0]
 };
-
 declare global {
   interface Window {
     webkitAudioContext?: typeof AudioContext;
@@ -455,29 +453,13 @@ function AuthScreen(props: {
                   placeholder="至少 6 位"
                 />
               </label>
-              <div className="inline-fields">
-                <label>
-                  学科
-                  <input
-                    value={registerForm.subjectName}
-                    onChange={(event) => setRegisterForm({ ...registerForm, subjectName: event.target.value })}
-                  />
-                </label>
-                <label>
-                  年级
-                  <input
-                    value={registerForm.gradeName}
-                    onChange={(event) => setRegisterForm({ ...registerForm, gradeName: event.target.value })}
-                  />
-                </label>
-                <label>
-                  班级
-                  <input
-                    value={registerForm.className}
-                    onChange={(event) => setRegisterForm({ ...registerForm, className: event.target.value })}
-                  />
-                </label>
-              </div>
+                            <label>
+                ??
+                <input
+                  value={registerForm.subjectName}
+                  onChange={(event) => setRegisterForm({ ...registerForm, subjectName: event.target.value })}
+                />
+              </label>
             </>
           ) : (
             <>
@@ -576,35 +558,39 @@ function StudentsView(props: {
   onAction: (action: () => Promise<void>, success?: string) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
-  const [studentForm, setStudentForm] = useState({ name: "", studentNo: "", aliases: "" });
+  const [studentName, setStudentName] = useState("");
   const [query, setQuery] = useState("");
   const [importRows, setImportRows] = useState<ImportRow[]>([]);
   const [importBatchId, setImportBatchId] = useState("");
   const [duplicateStrategy, setDuplicateStrategy] = useState<"skip" | "overwrite">("skip");
+  const [gradeName, setGradeName] = useState("");
+  const [className, setClassName] = useState("");
+  const [classGradeId, setClassGradeId] = useState(props.data.grades[0]?.id ?? "");
   const selectedClass = props.data.classrooms.find((classroom) => classroom.id === props.selectedClassId);
-  const students = props.data.students.filter((student) => {
-    const inClass = student.classId === props.selectedClassId;
-    const hit = !query || `${student.name}${student.studentNo ?? ""}${student.aliases.join("")}`.includes(query);
-    return inClass && hit;
-  });
+  const classStudents = props.data.students.filter((student) => student.classId === props.selectedClassId);
+  const students = classStudents.filter((student) => !query || student.name.includes(query));
+
+  useEffect(() => {
+    if (!classGradeId && props.data.grades[0]?.id) {
+      setClassGradeId(props.data.grades[0].id);
+    }
+  }, [classGradeId, props.data.grades]);
 
   async function createStudent(event: FormEvent) {
     event.preventDefault();
-    if (!selectedClass) {
-      return;
-    }
+    if (!selectedClass || !studentName.trim()) return;
     await props.onAction(async () => {
       await api("/api/students", {
         method: "POST",
         body: JSON.stringify({
-          name: studentForm.name,
-          studentNo: studentForm.studentNo || null,
-          aliases: studentForm.aliases.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean),
+          name: studentName.trim(),
+          studentNo: null,
+          aliases: [],
           gradeId: selectedClass.gradeId,
           classId: selectedClass.id
         })
       });
-      setStudentForm({ name: "", studentNo: "", aliases: "" });
+      setStudentName("");
       await props.onRefresh();
     }, "学生已加入");
   }
@@ -618,21 +604,19 @@ function StudentsView(props: {
         { method: "POST", body: form }
       );
       setImportBatchId(result.batchId);
-      setImportRows(result.rows);
+      setImportRows(result.rows.map((row) => ({ name: row.name, studentNo: null, aliases: [] })));
     }, "花名册已解析");
   }
 
   async function commitImport() {
-    if (!selectedClass || !importBatchId) {
-      return;
-    }
+    if (!selectedClass || !importBatchId) return;
     await props.onAction(async () => {
       await api(`/api/imports/${importBatchId}/commit`, {
         method: "POST",
         body: JSON.stringify({
           gradeId: selectedClass.gradeId,
           classId: selectedClass.id,
-          rows: importRows,
+          rows: importRows.map((row) => ({ name: row.name, studentNo: null, aliases: [] })),
           duplicateStrategy
         })
       });
@@ -642,14 +626,142 @@ function StudentsView(props: {
     }, "学生库已更新");
   }
 
+  async function moveStudent(studentId: string, direction: -1 | 1) {
+    if (!selectedClass) return;
+    const index = classStudents.findIndex((student) => student.id === studentId);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= classStudents.length) return;
+    const orderedIds = classStudents.map((student) => student.id);
+    [orderedIds[index], orderedIds[nextIndex]] = [orderedIds[nextIndex], orderedIds[index]];
+    await props.onAction(async () => {
+      await api(`/api/classes/${selectedClass.id}/students/order`, {
+        method: "PATCH",
+        body: JSON.stringify({ studentIds: orderedIds })
+      });
+      await props.onRefresh();
+    }, "花名册顺序已更新");
+  }
+
   return (
     <section className="screen-stack">
+      <section className="section-block">
+        <div className="section-heading">
+          <h3>年级与班级</h3>
+          <span className="count-badge ink">{props.data.classrooms.length}</span>
+        </div>
+        <form
+          className="compact-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!gradeName.trim()) return;
+            props.onAction(async () => {
+              await api("/api/grades", { method: "POST", body: JSON.stringify({ name: gradeName.trim() }) });
+              setGradeName("");
+              await props.onRefresh();
+            }, "年级已创建");
+          }}
+        >
+          <input value={gradeName} placeholder="新增年级，例如：九年级" onChange={(event) => setGradeName(event.target.value)} />
+          <button className="icon-text-button" disabled={props.busy}>
+            <Plus size={17} />
+            年级
+          </button>
+        </form>
+        <form
+          className="compact-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!className.trim() || !classGradeId) return;
+            props.onAction(async () => {
+              await api("/api/classes", { method: "POST", body: JSON.stringify({ name: className.trim(), gradeId: classGradeId }) });
+              setClassName("");
+              await props.onRefresh();
+            }, "班级已创建");
+          }}
+        >
+          <select value={classGradeId} onChange={(event) => setClassGradeId(event.target.value)}>
+            {props.data.grades.map((grade) => (
+              <option value={grade.id} key={grade.id}>
+                {grade.name}
+              </option>
+            ))}
+          </select>
+          <input value={className} placeholder="新增班级，例如：1班" onChange={(event) => setClassName(event.target.value)} />
+          <button className="icon-text-button" disabled={props.busy || props.data.grades.length === 0}>
+            <Plus size={17} />
+            班级
+          </button>
+        </form>
+        <div className="pill-list">
+          {props.data.grades.map((grade) => (
+            <span className="pill" key={grade.id}>
+              {grade.name}
+              <button
+                title="编辑年级"
+                onClick={() => {
+                  const nextName = window.prompt("年级名称", grade.name);
+                  if (!nextName) return;
+                  props.onAction(async () => {
+                    await api(`/api/grades/${grade.id}`, { method: "PATCH", body: JSON.stringify({ name: nextName }) });
+                    await props.onRefresh();
+                  }, "年级已更新");
+                }}
+              >
+                <RefreshCcw size={12} />
+              </button>
+              <button
+                title="删除年级"
+                onClick={() => {
+                  if (!window.confirm(`删除 ${grade.name}？年级下仍有班级时会被拒绝。`)) return;
+                  props.onAction(async () => {
+                    await api(`/api/grades/${grade.id}`, { method: "DELETE" });
+                    await props.onRefresh();
+                  }, "年级已删除");
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </span>
+          ))}
+          {props.data.classrooms.map((classroom) => (
+            <span className="pill" key={classroom.id}>
+              {classroom.grade?.name}{classroom.name}
+              <button
+                title="编辑班级"
+                onClick={() => {
+                  const nextName = window.prompt("班级名称", classroom.name);
+                  if (!nextName) return;
+                  props.onAction(async () => {
+                    await api(`/api/classes/${classroom.id}`, {
+                      method: "PATCH",
+                      body: JSON.stringify({ name: nextName, gradeId: classroom.gradeId })
+                    });
+                    await props.onRefresh();
+                  }, "班级已更新");
+                }}
+              >
+                <RefreshCcw size={12} />
+              </button>
+              <button
+                title="删除班级"
+                onClick={() => {
+                  if (!window.confirm(`删除 ${classroom.grade?.name}${classroom.name}？历史作业会保留。`)) return;
+                  props.onAction(async () => {
+                    await api(`/api/classes/${classroom.id}`, { method: "DELETE" });
+                    await props.onRefresh();
+                  }, "班级已删除");
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </span>
+          ))}
+        </div>
+      </section>
       <ClassSelect classes={props.data.classrooms} value={props.selectedClassId} onChange={props.onClassChange} />
       <form className="compact-form" onSubmit={createStudent}>
-        <input placeholder="姓名" value={studentForm.name} onChange={(event) => setStudentForm({ ...studentForm, name: event.target.value })} />
-        <input placeholder="学号" value={studentForm.studentNo} onChange={(event) => setStudentForm({ ...studentForm, studentNo: event.target.value })} />
-        <input placeholder="别名" value={studentForm.aliases} onChange={(event) => setStudentForm({ ...studentForm, aliases: event.target.value })} />
-        <button className="icon-text-button" disabled={props.busy}>
+        <input placeholder="姓名" value={studentName} onChange={(event) => setStudentName(event.target.value)} />
+        <button className="icon-text-button" disabled={props.busy || !selectedClass}>
           <Plus size={17} />
           新增
         </button>
@@ -681,7 +793,6 @@ function StudentsView(props: {
             {importRows.map((row, index) => (
               <div className="review-row" key={`${row.name}-${index}`}>
                 <input value={row.name} onChange={(event) => setImportRows(importRows.map((item, i) => (i === index ? { ...item, name: event.target.value } : item)))} />
-                <input value={row.studentNo ?? ""} placeholder="学号" onChange={(event) => setImportRows(importRows.map((item, i) => (i === index ? { ...item, studentNo: event.target.value } : item)))} />
                 <button type="button" className="icon-button small" onClick={() => setImportRows(importRows.filter((_, i) => i !== index))}>
                   <X size={15} />
                 </button>
@@ -701,52 +812,62 @@ function StudentsView(props: {
 
       <section className="student-list">
         {students.length === 0 ? <Empty label="当前班级暂无学生" /> : null}
-        {students.map((student) => (
-          <div className="student-row" key={student.id}>
-            <div>
-              <strong>{student.name}</strong>
-              <span>{student.studentNo ? `学号 ${student.studentNo}` : "未填学号"}</span>
+        {students.map((student) => {
+          const orderIndex = classStudents.findIndex((item) => item.id === student.id);
+          return (
+            <div className="student-row" key={student.id}>
+              <div>
+                <strong>{student.name}</strong>
+                <span>花名册第 {orderIndex + 1} 位</span>
+              </div>
+              <div className="row-actions">
+                <button className="icon-button small" title="上移" disabled={orderIndex <= 0} onClick={() => moveStudent(student.id, -1)}>
+                  <ArrowUp size={15} />
+                </button>
+                <button className="icon-button small" title="下移" disabled={orderIndex < 0 || orderIndex >= classStudents.length - 1} onClick={() => moveStudent(student.id, 1)}>
+                  <ArrowDown size={15} />
+                </button>
+                <button
+                  className="icon-button small"
+                  title="编辑学生"
+                  onClick={() => {
+                    const nextName = window.prompt("学生姓名", student.name);
+                    if (!nextName || !selectedClass) return;
+                    props.onAction(async () => {
+                      await api(`/api/students/${student.id}`, {
+                        method: "PATCH",
+                        body: JSON.stringify({
+                          name: nextName,
+                          studentNo: null,
+                          aliases: [],
+                          gradeId: selectedClass.gradeId,
+                          classId: selectedClass.id,
+                          displayOrder: student.displayOrder
+                        })
+                      });
+                      await props.onRefresh();
+                    }, "学生已更新");
+                  }}
+                >
+                  <RefreshCcw size={15} />
+                </button>
+                <button
+                  className="icon-button small danger"
+                  title="删除学生"
+                  onClick={() => {
+                    if (!window.confirm(`删除 ${student.name}？`)) return;
+                    props.onAction(async () => {
+                      await api(`/api/students/${student.id}`, { method: "DELETE" });
+                      await props.onRefresh();
+                    }, "学生已删除");
+                  }}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
             </div>
-            <div className="row-actions">
-              <button
-                className="icon-button small"
-                title="编辑学生"
-                onClick={() => {
-                  const nextName = window.prompt("学生姓名", student.name);
-                  if (!nextName || !selectedClass) return;
-                  props.onAction(async () => {
-                    await api(`/api/students/${student.id}`, {
-                      method: "PATCH",
-                      body: JSON.stringify({
-                        name: nextName,
-                        studentNo: student.studentNo,
-                        aliases: student.aliases,
-                        gradeId: selectedClass.gradeId,
-                        classId: selectedClass.id
-                      })
-                    });
-                    await props.onRefresh();
-                  }, "学生已更新");
-                }}
-              >
-                <RefreshCcw size={15} />
-              </button>
-              <button
-                className="icon-button small danger"
-                title="删除学生"
-                onClick={() => {
-                  if (!window.confirm(`删除 ${student.name}？`)) return;
-                  props.onAction(async () => {
-                    await api(`/api/students/${student.id}`, { method: "DELETE" });
-                    await props.onRefresh();
-                  }, "学生已删除");
-                }}
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </section>
     </section>
   );

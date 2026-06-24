@@ -15,7 +15,6 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import * as XLSX from "xlsx";
 import { z } from "zod";
 import {
-  DEFAULT_GRADES,
   DEFAULT_SUBJECTS,
   classSchema,
   homeworkTaskSchema,
@@ -24,6 +23,7 @@ import {
   matchStudentName,
   namedEntitySchema,
   studentSchema,
+  studentOrderSchema,
   submissionStatusSchema,
   teacherRegisterSchema,
   voiceMatchSchema,
@@ -178,7 +178,7 @@ function camelTeacher(row: Row) {
 }
 
 function camelGrade(row: Row) {
-  return { id: String(row.id), name: String(row.name), teacherId: String(row.teacher_id) };
+  return { id: String(row.id), name: String(row.name), teacherId: String(row.teacher_id), deletedAt: row.deleted_at ? String(row.deleted_at) : null };
 }
 
 function camelSubject(row: Row) {
@@ -192,6 +192,7 @@ function camelClass(row: Row) {
     name: String(row.name),
     teacherId: String(row.teacher_id),
     gradeId: String(row.grade_id),
+    deletedAt: row.deleted_at ? String(row.deleted_at) : null,
     grade
   };
 }
@@ -205,39 +206,40 @@ function camelStudent(row: Row) {
     teacherId: String(row.teacher_id),
     gradeId: String(row.grade_id),
     classId: String(row.class_id),
+    displayOrder: Number(row.display_order ?? 0),
+    deletedAt: row.deleted_at ? String(row.deleted_at) : null,
     grade: row.grade_name ? { id: String(row.grade_id), name: String(row.grade_name) } : undefined,
     classroom: row.class_name ? { id: String(row.class_id), name: String(row.class_name), gradeId: String(row.grade_id) } : undefined
   };
 }
 
-function getGrades(currentTeacherId: string) {
-  return all("SELECT * FROM grades WHERE teacher_id = ? ORDER BY name", currentTeacherId).map(camelGrade);
+function getGrades() {
+  return all("SELECT * FROM grades WHERE deleted_at IS NULL ORDER BY name").map(camelGrade);
 }
 
 function getSubjects(currentTeacherId: string) {
   return all("SELECT * FROM subjects WHERE teacher_id = ? ORDER BY name", currentTeacherId).map(camelSubject);
 }
 
-function getClasses(currentTeacherId: string) {
+function getClasses() {
   return all(
     `SELECT c.*, g.name AS grade_name
      FROM classrooms c
      JOIN grades g ON g.id = c.grade_id
-     WHERE c.teacher_id = ?
-     ORDER BY g.name, c.name`,
-    currentTeacherId
+     WHERE c.deleted_at IS NULL AND g.deleted_at IS NULL
+     ORDER BY g.name, c.name`
   ).map(camelClass);
 }
 
-function getStudents(currentTeacherId: string, classId?: string) {
+function getStudents(classId?: string) {
   return all(
     `SELECT s.*, g.name AS grade_name, c.name AS class_name
      FROM students s
      JOIN grades g ON g.id = s.grade_id
      JOIN classrooms c ON c.id = s.class_id
-     WHERE s.teacher_id = ? ${classId ? "AND s.class_id = ?" : ""}
-     ORDER BY c.name, s.name`,
-    ...(classId ? [currentTeacherId, classId] : [currentTeacherId])
+     WHERE s.deleted_at IS NULL AND c.deleted_at IS NULL AND g.deleted_at IS NULL ${classId ? "AND s.class_id = ?" : ""}
+     ORDER BY g.name, c.name, s.display_order, s.created_at`,
+    ...(classId ? [classId] : [])
   ).map(camelStudent);
 }
 
@@ -256,11 +258,11 @@ function getTaskRows(currentTeacherId: string) {
 
 function getSubmissions(taskId: string) {
   return all(
-    `SELECT hs.*, st.name AS student_name, st.student_no, st.aliases, st.grade_id, st.class_id
+    `SELECT hs.*, st.name AS student_name, st.student_no, st.aliases, st.grade_id, st.class_id, st.display_order
      FROM homework_submissions hs
      JOIN students st ON st.id = hs.student_id
      WHERE hs.task_id = ?
-     ORDER BY st.name`,
+     ORDER BY st.display_order, hs.created_at`,
     taskId
   ).map((row) => ({
     id: String(row.id),
@@ -271,11 +273,12 @@ function getSubmissions(taskId: string) {
     rawText: row.raw_text ? String(row.raw_text) : null,
     student: {
       id: String(row.student_id),
-      name: String(row.student_name),
+      name: row.student_name_snapshot ? String(row.student_name_snapshot) : String(row.student_name),
       studentNo: row.student_no ? String(row.student_no) : null,
       aliases: parseJsonList(row.aliases),
       gradeId: String(row.grade_id),
-      classId: String(row.class_id)
+      classId: String(row.class_id),
+      displayOrder: Number(row.display_order ?? 0)
     }
   }));
 }
@@ -291,9 +294,13 @@ function camelTask(row: Row) {
     subjectId: String(row.subject_id),
     gradeId: String(row.grade_id),
     classId: String(row.class_id),
-    subject: { id: String(row.subject_id), name: String(row.subject_name) },
-    grade: { id: String(row.grade_id), name: String(row.grade_name) },
-    classroom: { id: String(row.class_id), name: String(row.class_name), gradeId: String(row.grade_id) },
+    subject: { id: String(row.subject_id), name: row.subject_name_snapshot ? String(row.subject_name_snapshot) : String(row.subject_name) },
+    grade: { id: String(row.grade_id), name: row.grade_name_snapshot ? String(row.grade_name_snapshot) : String(row.grade_name) },
+    classroom: {
+      id: String(row.class_id),
+      name: row.class_name_snapshot ? String(row.class_name_snapshot) : String(row.class_name),
+      gradeId: String(row.grade_id)
+    },
     submissions,
     stats: taskStats(submissions)
   };
@@ -479,8 +486,8 @@ function parseVolcengineResponse(message: RawData) {
   };
 }
 
-function ensureClass(currentTeacherId: string, gradeId: string, classId: string) {
-  const classroom = one("SELECT id FROM classrooms WHERE id = ? AND grade_id = ? AND teacher_id = ?", classId, gradeId, currentTeacherId);
+function ensureClass(_currentTeacherId: string, gradeId: string, classId: string) {
+  const classroom = one("SELECT id FROM classrooms WHERE id = ? AND grade_id = ? AND deleted_at IS NULL", classId, gradeId);
   if (!classroom) {
     throw new Error("班级不存在或无权访问");
   }
@@ -521,12 +528,6 @@ app.post("/api/auth/register", async (req, res, next) => {
     const created = withTransaction(() => {
       const id = createId();
       run("INSERT INTO teachers (id, username, name, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", id, input.username, input.name, passwordHash, timestamp, timestamp);
-      for (const name of new Set([...DEFAULT_GRADES, input.gradeName])) {
-        run("INSERT OR IGNORE INTO grades (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, id, timestamp, timestamp);
-      }
-      const grade = one("SELECT id FROM grades WHERE teacher_id = ? AND name = ?", id, input.gradeName);
-      if (!grade) throw new Error("默认年级创建失败");
-      run("INSERT INTO classrooms (id, name, teacher_id, grade_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", createId(), input.className, id, String(grade.id), timestamp, timestamp);
       for (const name of new Set([...DEFAULT_SUBJECTS, input.subjectName])) {
         run("INSERT OR IGNORE INTO subjects (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, id, timestamp, timestamp);
       }
@@ -573,10 +574,10 @@ app.get("/api/bootstrap", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const currentTeacherId = teacherId(req);
     return ok(res, {
-      grades: getGrades(currentTeacherId),
-      classrooms: getClasses(currentTeacherId),
+      grades: getGrades(),
+      classrooms: getClasses(),
       subjects: getSubjects(currentTeacherId),
-      students: getStudents(currentTeacherId),
+      students: getStudents(),
       tasks: getTaskRows(currentTeacherId).slice(0, 30).map(camelTask)
     });
   } catch (error) {
@@ -584,10 +585,17 @@ app.get("/api/bootstrap", requireAuth, (req: AuthRequest, res, next) => {
   }
 });
 
-app.get("/api/grades", requireAuth, (req: AuthRequest, res) => ok(res, getGrades(teacherId(req))));
+app.get("/api/grades", requireAuth, (_req: AuthRequest, res) => ok(res, getGrades()));
 app.post("/api/grades", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = namedEntitySchema.parse(req.body);
+    const existing = one("SELECT * FROM grades WHERE name = ?", input.name);
+    if (existing) {
+      if (existing.deleted_at) {
+        run("UPDATE grades SET deleted_at = NULL, updated_at = ? WHERE id = ?", nowIso(), String(existing.id));
+      }
+      return ok(res, camelGrade(one("SELECT * FROM grades WHERE id = ?", String(existing.id))!));
+    }
     const id = createId();
     const timestamp = nowIso();
     run("INSERT INTO grades (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", id, input.name, teacherId(req), timestamp, timestamp);
@@ -599,29 +607,43 @@ app.post("/api/grades", requireAuth, (req: AuthRequest, res, next) => {
 app.patch("/api/grades/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = namedEntitySchema.parse(req.body);
-    run("UPDATE grades SET name = ?, updated_at = ? WHERE id = ? AND teacher_id = ?", input.name, nowIso(), routeParam(req, "id"), teacherId(req));
-    return ok(res, camelGrade(one("SELECT * FROM grades WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), teacherId(req))!));
+    run("UPDATE grades SET name = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, nowIso(), routeParam(req, "id"));
+    return ok(res, camelGrade(one("SELECT * FROM grades WHERE id = ?", routeParam(req, "id"))!));
   } catch (error) {
     return next(error);
   }
 });
-app.delete("/api/grades/:id", requireAuth, (req: AuthRequest, res) => {
-  run("DELETE FROM grades WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), teacherId(req));
+app.delete("/api/grades/:id", requireAuth, (req: AuthRequest, res, next) => {
+  try {
+    const activeClass = one("SELECT id FROM classrooms WHERE grade_id = ? AND deleted_at IS NULL", routeParam(req, "id"));
+    if (activeClass) {
+      throw new Error("该年级下仍有班级，不能删除");
+    }
+    run("UPDATE grades SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
+  } catch (error) {
+    return next(error);
+  }
   return ok(res, { success: true });
 });
 
-app.get("/api/classes", requireAuth, (req: AuthRequest, res) => ok(res, getClasses(teacherId(req))));
+app.get("/api/classes", requireAuth, (_req: AuthRequest, res) => ok(res, getClasses()));
 app.post("/api/classes", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = classSchema.parse(req.body);
-    const currentTeacherId = teacherId(req);
-    if (!one("SELECT id FROM grades WHERE id = ? AND teacher_id = ?", input.gradeId, currentTeacherId)) {
+    if (!one("SELECT id FROM grades WHERE id = ? AND deleted_at IS NULL", input.gradeId)) {
       throw new Error("年级不存在或无权访问");
+    }
+    const existing = one("SELECT * FROM classrooms WHERE grade_id = ? AND name = ?", input.gradeId, input.name);
+    if (existing) {
+      if (existing.deleted_at) {
+        run("UPDATE classrooms SET deleted_at = NULL, updated_at = ? WHERE id = ?", nowIso(), String(existing.id));
+      }
+      return ok(res, getClasses().find((item) => item.id === String(existing.id)));
     }
     const id = createId();
     const timestamp = nowIso();
-    run("INSERT INTO classrooms (id, name, teacher_id, grade_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", id, input.name, currentTeacherId, input.gradeId, timestamp, timestamp);
-    return ok(res, getClasses(currentTeacherId).find((item) => item.id === id));
+    run("INSERT INTO classrooms (id, name, teacher_id, grade_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", id, input.name, teacherId(req), input.gradeId, timestamp, timestamp);
+    return ok(res, getClasses().find((item) => item.id === id));
   } catch (error) {
     return next(error);
   }
@@ -629,15 +651,14 @@ app.post("/api/classes", requireAuth, (req: AuthRequest, res, next) => {
 app.patch("/api/classes/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = classSchema.parse(req.body);
-    const currentTeacherId = teacherId(req);
-    run("UPDATE classrooms SET name = ?, grade_id = ?, updated_at = ? WHERE id = ? AND teacher_id = ?", input.name, input.gradeId, nowIso(), routeParam(req, "id"), currentTeacherId);
-    return ok(res, getClasses(currentTeacherId).find((item) => item.id === routeParam(req, "id")));
+    run("UPDATE classrooms SET name = ?, grade_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.gradeId, nowIso(), routeParam(req, "id"));
+    return ok(res, getClasses().find((item) => item.id === routeParam(req, "id")));
   } catch (error) {
     return next(error);
   }
 });
 app.delete("/api/classes/:id", requireAuth, (req: AuthRequest, res) => {
-  run("DELETE FROM classrooms WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), teacherId(req));
+  run("UPDATE classrooms SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
   return ok(res, { success: true });
 });
 
@@ -669,17 +690,27 @@ app.delete("/api/subjects/:id", requireAuth, (req: AuthRequest, res) => {
 
 app.get("/api/students", requireAuth, (req: AuthRequest, res) => {
   const classId = typeof req.query.classId === "string" ? req.query.classId : undefined;
-  return ok(res, getStudents(teacherId(req), classId));
+  return ok(res, getStudents(classId));
 });
 app.post("/api/students", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = studentSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     ensureClass(currentTeacherId, input.gradeId, input.classId);
+    const existing = one("SELECT * FROM students WHERE class_id = ? AND name = ?", input.classId, input.name);
+    if (existing) {
+      if (existing.deleted_at) {
+        const maxOrder = one<{ max_order?: number }>("SELECT MAX(display_order) AS max_order FROM students WHERE class_id = ? AND deleted_at IS NULL", input.classId);
+        run("UPDATE students SET deleted_at = NULL, display_order = ?, updated_at = ? WHERE id = ?", Number(maxOrder?.max_order ?? 0) + 1, nowIso(), String(existing.id));
+      }
+      return ok(res, getStudents().find((item) => item.id === String(existing.id)));
+    }
     const id = createId();
     const timestamp = nowIso();
-    run("INSERT INTO students (id, name, student_no, aliases, teacher_id, grade_id, class_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", id, input.name, input.studentNo ?? null, JSON.stringify(input.aliases), currentTeacherId, input.gradeId, input.classId, timestamp, timestamp);
-    return ok(res, getStudents(currentTeacherId).find((item) => item.id === id));
+    const maxOrder = one<{ max_order?: number }>("SELECT MAX(display_order) AS max_order FROM students WHERE class_id = ? AND deleted_at IS NULL", input.classId);
+    const displayOrder = input.displayOrder ?? Number(maxOrder?.max_order ?? 0) + 1;
+    run("INSERT INTO students (id, name, student_no, aliases, teacher_id, grade_id, class_id, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, input.name, input.studentNo ?? null, JSON.stringify(input.aliases), currentTeacherId, input.gradeId, input.classId, displayOrder, timestamp, timestamp);
+    return ok(res, getStudents().find((item) => item.id === id));
   } catch (error) {
     return next(error);
   }
@@ -689,15 +720,34 @@ app.patch("/api/students/:id", requireAuth, (req: AuthRequest, res, next) => {
     const input = studentSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     ensureClass(currentTeacherId, input.gradeId, input.classId);
-    run("UPDATE students SET name = ?, student_no = ?, aliases = ?, grade_id = ?, class_id = ?, updated_at = ? WHERE id = ? AND teacher_id = ?", input.name, input.studentNo ?? null, JSON.stringify(input.aliases), input.gradeId, input.classId, nowIso(), routeParam(req, "id"), currentTeacherId);
-    return ok(res, getStudents(currentTeacherId).find((item) => item.id === routeParam(req, "id")));
+    const existing = one<{ display_order?: number }>("SELECT display_order FROM students WHERE id = ?", routeParam(req, "id"));
+    run("UPDATE students SET name = ?, student_no = ?, aliases = ?, grade_id = ?, class_id = ?, display_order = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.studentNo ?? null, JSON.stringify(input.aliases), input.gradeId, input.classId, input.displayOrder ?? Number(existing?.display_order ?? 0), nowIso(), routeParam(req, "id"));
+    return ok(res, getStudents().find((item) => item.id === routeParam(req, "id")));
   } catch (error) {
     return next(error);
   }
 });
 app.delete("/api/students/:id", requireAuth, (req: AuthRequest, res) => {
-  run("DELETE FROM students WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), teacherId(req));
+  run("UPDATE students SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
   return ok(res, { success: true });
+});
+
+app.patch("/api/classes/:id/students/order", requireAuth, (req: AuthRequest, res, next) => {
+  try {
+    const input = studentOrderSchema.parse(req.body);
+    const classId = routeParam(req, "id");
+    if (!one("SELECT id FROM classrooms WHERE id = ? AND deleted_at IS NULL", classId)) {
+      throw new Error("班级不存在或已删除");
+    }
+    withTransaction(() => {
+      input.studentIds.forEach((studentId, index) => {
+        run("UPDATE students SET display_order = ?, updated_at = ? WHERE id = ? AND class_id = ? AND deleted_at IS NULL", index + 1, nowIso(), studentId, classId);
+      });
+    });
+    return ok(res, getStudents(classId));
+  } catch (error) {
+    return next(error);
+  }
 });
 
 app.get("/api/homework-tasks", requireAuth, (req: AuthRequest, res) => ok(res, getTaskRows(teacherId(req)).map(camelTask)));
@@ -712,10 +762,28 @@ app.post("/api/homework-tasks", requireAuth, (req: AuthRequest, res, next) => {
     const taskId = withTransaction(() => {
       const id = createId();
       const timestamp = nowIso();
-      run("INSERT INTO homework_tasks (id, title, due_date, status, teacher_id, subject_id, grade_id, class_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", id, input.title, parseDate(input.dueDate), input.status, currentTeacherId, input.subjectId, input.gradeId, input.classId, timestamp, timestamp);
-      const students = all("SELECT id FROM students WHERE teacher_id = ? AND class_id = ?", currentTeacherId, input.classId);
+      const grade = one("SELECT name FROM grades WHERE id = ?", input.gradeId);
+      const classroom = one("SELECT name FROM classrooms WHERE id = ?", input.classId);
+      const subject = one("SELECT name FROM subjects WHERE id = ?", input.subjectId);
+      run(
+        "INSERT INTO homework_tasks (id, title, due_date, status, teacher_id, subject_id, grade_id, class_id, grade_name_snapshot, class_name_snapshot, subject_name_snapshot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        id,
+        input.title,
+        parseDate(input.dueDate),
+        input.status,
+        currentTeacherId,
+        input.subjectId,
+        input.gradeId,
+        input.classId,
+        grade ? String(grade.name) : null,
+        classroom ? String(classroom.name) : null,
+        subject ? String(subject.name) : null,
+        timestamp,
+        timestamp
+      );
+      const students = all("SELECT id, name FROM students WHERE class_id = ? AND deleted_at IS NULL ORDER BY display_order, created_at", input.classId);
       for (const student of students) {
-        run("INSERT INTO homework_submissions (id, task_id, student_id, status, source, created_at, updated_at) VALUES (?, ?, ?, 'missing', 'system', ?, ?)", createId(), id, String(student.id), timestamp, timestamp);
+        run("INSERT INTO homework_submissions (id, task_id, student_id, status, source, student_name_snapshot, created_at, updated_at) VALUES (?, ?, ?, 'missing', 'system', ?, ?, ?)", createId(), id, String(student.id), String(student.name), timestamp, timestamp);
       }
       return id;
     });
@@ -736,7 +804,24 @@ app.patch("/api/homework-tasks/:id", requireAuth, (req: AuthRequest, res, next) 
     const input = homeworkTaskSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     ensureClass(currentTeacherId, input.gradeId, input.classId);
-    run("UPDATE homework_tasks SET title = ?, due_date = ?, status = ?, subject_id = ?, grade_id = ?, class_id = ?, updated_at = ? WHERE id = ? AND teacher_id = ?", input.title, parseDate(input.dueDate), input.status, input.subjectId, input.gradeId, input.classId, nowIso(), routeParam(req, "id"), currentTeacherId);
+    const grade = one("SELECT name FROM grades WHERE id = ?", input.gradeId);
+    const classroom = one("SELECT name FROM classrooms WHERE id = ?", input.classId);
+    const subject = one("SELECT name FROM subjects WHERE id = ?", input.subjectId);
+    run(
+      "UPDATE homework_tasks SET title = ?, due_date = ?, status = ?, subject_id = ?, grade_id = ?, class_id = ?, grade_name_snapshot = ?, class_name_snapshot = ?, subject_name_snapshot = ?, updated_at = ? WHERE id = ? AND teacher_id = ?",
+      input.title,
+      parseDate(input.dueDate),
+      input.status,
+      input.subjectId,
+      input.gradeId,
+      input.classId,
+      grade ? String(grade.name) : null,
+      classroom ? String(classroom.name) : null,
+      subject ? String(subject.name) : null,
+      nowIso(),
+      routeParam(req, "id"),
+      currentTeacherId
+    );
     return ok(res, getTaskForTeacher(routeParam(req, "id"), currentTeacherId));
   } catch (error) {
     return next(error);
@@ -831,21 +916,28 @@ app.post("/api/imports/:id/commit", requireAuth, (req: AuthRequest, res, next) =
     const timestamp = nowIso();
     withTransaction(() => {
       for (const row of input.rows) {
-        const existing = one("SELECT id FROM students WHERE teacher_id = ? AND class_id = ? AND name = ?", currentTeacherId, input.classId, row.name);
+        const existing = one("SELECT id, deleted_at FROM students WHERE class_id = ? AND name = ?", input.classId, row.name);
+        if (existing?.deleted_at) {
+          const maxOrder = one<{ max_order?: number }>("SELECT MAX(display_order) AS max_order FROM students WHERE class_id = ? AND deleted_at IS NULL", input.classId);
+          run("UPDATE students SET student_no = ?, aliases = ?, grade_id = ?, class_id = ?, display_order = ?, deleted_at = NULL, updated_at = ? WHERE id = ?", row.studentNo ?? null, JSON.stringify(row.aliases), input.gradeId, input.classId, Number(maxOrder?.max_order ?? 0) + 1, timestamp, String(existing.id));
+          overwritten += 1;
+          continue;
+        }
         if (existing && input.duplicateStrategy === "skip") {
           skipped += 1;
           continue;
         }
         if (existing) {
           overwritten += 1;
-          run("UPDATE students SET student_no = ?, aliases = ?, grade_id = ?, class_id = ?, updated_at = ? WHERE id = ?", row.studentNo ?? null, JSON.stringify(row.aliases), input.gradeId, input.classId, timestamp, String(existing.id));
+          run("UPDATE students SET student_no = ?, aliases = ?, grade_id = ?, class_id = ?, deleted_at = NULL, updated_at = ? WHERE id = ?", row.studentNo ?? null, JSON.stringify(row.aliases), input.gradeId, input.classId, timestamp, String(existing.id));
           continue;
         }
         created += 1;
-        run("INSERT INTO students (id, name, student_no, aliases, teacher_id, grade_id, class_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", createId(), row.name, row.studentNo ?? null, JSON.stringify(row.aliases), currentTeacherId, input.gradeId, input.classId, timestamp, timestamp);
+        const maxOrder = one<{ max_order?: number }>("SELECT MAX(display_order) AS max_order FROM students WHERE class_id = ? AND deleted_at IS NULL", input.classId);
+        run("INSERT INTO students (id, name, student_no, aliases, teacher_id, grade_id, class_id, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", createId(), row.name, row.studentNo ?? null, JSON.stringify(row.aliases), currentTeacherId, input.gradeId, input.classId, Number(maxOrder?.max_order ?? 0) + 1, timestamp, timestamp);
       }
     });
-    return ok(res, { created, skipped, overwritten, students: getStudents(currentTeacherId, input.classId) });
+    return ok(res, { created, skipped, overwritten, students: getStudents(input.classId) });
   } catch (error) {
     return next(error);
   }
