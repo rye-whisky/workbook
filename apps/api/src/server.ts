@@ -60,6 +60,7 @@ const secureCookies = process.env.COOKIE_SECURE
   : webOrigin.startsWith("https://");
 const asrProvider = (process.env.ASR_PROVIDER ?? "disabled") as AsrProvider;
 const asrMockText = process.env.ASR_MOCK_TEXT ?? "张三";
+const defaultVolcengineAsrEndpoint = "wss://openspeech.bytedance.com/api/v2/asr";
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -345,6 +346,10 @@ function teacherIdFromUpgrade(req: http.IncomingMessage) {
   } catch {
     return null;
   }
+}
+
+function volcengineAuthorizationHeader(token: string) {
+  return `Bearer; ${token}`;
 }
 
 function ensureClass(currentTeacherId: string, gradeId: string, classId: string) {
@@ -757,19 +762,20 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   }
 
   function connectVolcengine() {
-    const endpoint = process.env.VOLCENGINE_ASR_ENDPOINT;
+    const endpoint = process.env.VOLCENGINE_ASR_ENDPOINT || defaultVolcengineAsrEndpoint;
     const appId = process.env.VOLCENGINE_ASR_APP_ID;
     const token = process.env.VOLCENGINE_ASR_ACCESS_TOKEN;
     const cluster = process.env.VOLCENGINE_ASR_CLUSTER;
-    if (!endpoint || !appId || !token || !cluster) {
+    if (!appId || !token || !cluster) {
       sendAsr(ws, { type: "error", message: "火山引擎 ASR 未配置完整，请检查服务器 .env" });
       return null;
     }
 
     const providerSocket = new WebSocket(endpoint, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: volcengineAuthorizationHeader(token),
         "X-Api-App-Id": appId,
+        "X-Api-Access-Key": token,
         "X-Api-Cluster": cluster
       }
     });
@@ -778,14 +784,21 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       providerSocket.send(
         JSON.stringify({
           type: "start",
-          app: { appid: appId, cluster },
+          app: { appid: appId, token, cluster },
           user: { uid: asrContext.teacherId },
-          request: { reqid: createId(), workflow: "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate" },
+          request: {
+            reqid: createId(),
+            workflow: "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate",
+            result_type: "full",
+            sequence: 1
+          },
           audio: {
             format: process.env.VOLCENGINE_ASR_FORMAT ?? "pcm",
-            sample_rate: Number(process.env.VOLCENGINE_ASR_SAMPLE_RATE ?? 16000),
+            rate: Number(process.env.VOLCENGINE_ASR_SAMPLE_RATE ?? 16000),
             language: process.env.VOLCENGINE_ASR_LANGUAGE ?? "zh-CN",
-            channel: 1
+            bits: 16,
+            channel: 1,
+            codec: "raw"
           }
         })
       );
