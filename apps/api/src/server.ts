@@ -1,5 +1,6 @@
 ﻿import "dotenv/config";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
@@ -9,6 +10,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import { createWorker } from "tesseract.js";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 import * as XLSX from "xlsx";
 import { z } from "zod";
 import {
@@ -25,6 +27,8 @@ import {
   teacherRegisterSchema,
   voiceMatchSchema,
   type ApiEnvelope,
+  type AsrProvider,
+  type AsrServerEvent,
   type StudentLite,
   type TaskStats
 } from "@workbook/shared";
@@ -36,7 +40,16 @@ interface AuthRequest extends Request {
   teacherId?: string;
 }
 
+interface AsrUpgradeRequest extends http.IncomingMessage {
+  asrContext?: {
+    teacherId: string;
+    taskId: string;
+  };
+}
+
 const app = express();
+const server = http.createServer(app);
+const asrWss = new WebSocketServer({ noServer: true });
 const port = Number(process.env.PORT ?? 4100);
 const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 const sessionSecret = process.env.SESSION_SECRET ?? "dev-only-change-me";
@@ -45,6 +58,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const secureCookies = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === "true"
   : webOrigin.startsWith("https://");
+const asrProvider = (process.env.ASR_PROVIDER ?? "disabled") as AsrProvider;
+const asrMockText = process.env.ASR_MOCK_TEXT ?? "张三";
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -278,6 +293,58 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
     throw new Error("作业任务不存在或无权访问");
   }
   return camelTask(row);
+}
+
+function applyVoiceMatch(taskId: string, currentTeacherId: string, text: string, source = "voice") {
+  const task = getTaskForTeacher(taskId, currentTeacherId);
+  const students: StudentLite[] = task.submissions.map((submission) => ({
+    id: submission.student.id,
+    name: submission.student.name,
+    studentNo: submission.student.studentNo,
+    aliases: submission.student.aliases
+  }));
+  const match = matchStudentName(text, students);
+  if (match.matchedStudentId) {
+    run(
+      "UPDATE homework_submissions SET status = 'submitted', source = ?, raw_text = ?, updated_at = ? WHERE task_id = ? AND student_id = ?",
+      source,
+      text,
+      nowIso(),
+      taskId,
+      match.matchedStudentId
+    );
+  }
+  return { match, task: getTaskForTeacher(taskId, currentTeacherId) };
+}
+
+function sendAsr(ws: WebSocket, event: AsrServerEvent) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(event));
+  }
+}
+
+function parseCookieHeader(header: string | undefined) {
+  const result = new Map<string, string>();
+  for (const item of (header ?? "").split(";")) {
+    const [rawKey, ...rawValue] = item.trim().split("=");
+    if (rawKey) {
+      result.set(rawKey, decodeURIComponent(rawValue.join("=")));
+    }
+  }
+  return result;
+}
+
+function teacherIdFromUpgrade(req: http.IncomingMessage) {
+  const token = parseCookieHeader(req.headers.cookie).get("workbook_session");
+  if (!token) {
+    return null;
+  }
+  try {
+    const payload = jwt.verify(token, sessionSecret) as { teacherId?: string };
+    return payload.teacherId ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function ensureClass(currentTeacherId: string, gradeId: string, classId: string) {
@@ -571,18 +638,7 @@ app.post("/api/homework-tasks/:id/voice-matches", requireAuth, (req: AuthRequest
   try {
     const input = voiceMatchSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
-    const task = getTaskForTeacher(routeParam(req, "id"), currentTeacherId);
-    const students: StudentLite[] = task.submissions.map((submission) => ({
-      id: submission.student.id,
-      name: submission.student.name,
-      studentNo: submission.student.studentNo,
-      aliases: submission.student.aliases
-    }));
-    const match = matchStudentName(input.text, students);
-    if (match.matchedStudentId) {
-      run("UPDATE homework_submissions SET status = 'submitted', source = 'voice', raw_text = ?, updated_at = ? WHERE task_id = ? AND student_id = ?", input.text, nowIso(), routeParam(req, "id"), match.matchedStudentId);
-    }
-    return ok(res, { match, task: getTaskForTeacher(routeParam(req, "id"), currentTeacherId) });
+    return ok(res, applyVoiceMatch(routeParam(req, "id"), currentTeacherId, input.text, "voice"));
   } catch (error) {
     return next(error);
   }
@@ -663,6 +719,172 @@ app.post("/api/imports/:id/commit", requireAuth, (req: AuthRequest, res, next) =
   }
 });
 
+asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
+  const context = req.asrContext;
+  if (!context) {
+    sendAsr(ws, { type: "error", message: "ASR session missing context" });
+    ws.close();
+    return;
+  }
+  const asrContext = context;
+
+  let upstream: WebSocket | null = null;
+  let started = false;
+
+  function closeUpstream() {
+    if (upstream && upstream.readyState === WebSocket.OPEN) {
+      upstream.close();
+    }
+    upstream = null;
+  }
+
+  function handleFinalText(text: string) {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+    try {
+      const result = applyVoiceMatch(asrContext.taskId, asrContext.teacherId, normalized, "asr");
+      const payload = {
+        text: normalized,
+        match: result.match,
+        stats: result.task.stats
+      };
+      sendAsr(ws, result.match.needsConfirmation ? { type: "pending", ...payload } : { type: "final", ...payload });
+    } catch (error) {
+      sendAsr(ws, { type: "error", message: error instanceof Error ? error.message : "语音匹配失败" });
+    }
+  }
+
+  function connectVolcengine() {
+    const endpoint = process.env.VOLCENGINE_ASR_ENDPOINT;
+    const appId = process.env.VOLCENGINE_ASR_APP_ID;
+    const token = process.env.VOLCENGINE_ASR_ACCESS_TOKEN;
+    const cluster = process.env.VOLCENGINE_ASR_CLUSTER;
+    if (!endpoint || !appId || !token || !cluster) {
+      sendAsr(ws, { type: "error", message: "火山引擎 ASR 未配置完整，请检查服务器 .env" });
+      return null;
+    }
+
+    const providerSocket = new WebSocket(endpoint, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "X-Api-App-Id": appId,
+        "X-Api-Cluster": cluster
+      }
+    });
+
+    providerSocket.on("open", () => {
+      providerSocket.send(
+        JSON.stringify({
+          type: "start",
+          app: { appid: appId, cluster },
+          user: { uid: asrContext.teacherId },
+          request: { reqid: createId(), workflow: "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate" },
+          audio: {
+            format: process.env.VOLCENGINE_ASR_FORMAT ?? "pcm",
+            sample_rate: Number(process.env.VOLCENGINE_ASR_SAMPLE_RATE ?? 16000),
+            language: process.env.VOLCENGINE_ASR_LANGUAGE ?? "zh-CN",
+            channel: 1
+          }
+        })
+      );
+      sendAsr(ws, { type: "ready", provider: "volcengine" });
+    });
+
+    providerSocket.on("message", (message) => {
+      const raw = message.toString();
+      try {
+        const data = JSON.parse(raw) as Record<string, unknown>;
+        const text =
+          typeof data.text === "string"
+            ? data.text
+            : typeof data.result === "string"
+              ? data.result
+              : typeof (data.result as Record<string, unknown> | undefined)?.text === "string"
+                ? String((data.result as Record<string, unknown>).text)
+                : "";
+        const isFinal = data.is_final === true || data.final === true || data.type === "final";
+        if (text && isFinal) {
+          handleFinalText(text);
+        } else if (text) {
+          sendAsr(ws, { type: "partial", text });
+        }
+      } catch {
+        sendAsr(ws, { type: "status", message: "收到火山 ASR 非 JSON 响应" });
+      }
+    });
+
+    providerSocket.on("error", () => {
+      sendAsr(ws, { type: "error", message: "火山引擎 ASR 连接失败" });
+    });
+
+    providerSocket.on("close", () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        sendAsr(ws, { type: "closed" });
+      }
+    });
+
+    return providerSocket;
+  }
+
+  sendAsr(ws, { type: "ready", provider: asrProvider });
+
+  ws.on("message", (message: RawData, isBinary) => {
+    if (isBinary) {
+      if (asrProvider === "volcengine" && upstream?.readyState === WebSocket.OPEN) {
+        upstream.send(message);
+      }
+      return;
+    }
+
+    let event: { type?: string; text?: string };
+    try {
+      event = JSON.parse(message.toString()) as { type?: string; text?: string };
+    } catch {
+      sendAsr(ws, { type: "error", message: "ASR 控制消息格式错误" });
+      return;
+    }
+
+    if (event.type === "start") {
+      if (started) {
+        return;
+      }
+      started = true;
+      if (asrProvider === "disabled" || asrProvider === "browser") {
+        sendAsr(ws, { type: "error", message: "云端 ASR 未启用，请配置 ASR_PROVIDER=mock 或 volcengine" });
+        return;
+      }
+      if (asrProvider === "mock") {
+        sendAsr(ws, { type: "status", message: "Mock ASR 已开始，结束录音后返回测试姓名" });
+        return;
+      }
+      if (asrProvider === "volcengine") {
+        upstream = connectVolcengine();
+      }
+      return;
+    }
+
+    if (event.type === "mock-final" && event.text) {
+      handleFinalText(event.text);
+      return;
+    }
+
+    if (event.type === "stop") {
+      if (asrProvider === "mock") {
+        handleFinalText(event.text || asrMockText);
+      } else if (upstream?.readyState === WebSocket.OPEN) {
+        upstream.send(JSON.stringify({ type: "stop" }));
+      }
+      sendAsr(ws, { type: "closed" });
+      closeUpstream();
+      return;
+    }
+  });
+
+  ws.on("close", closeUpstream);
+});
+
 app.use((error: unknown, _req: Request, res: Response<ApiEnvelope<never>>, _next: NextFunction) => {
   if (error instanceof z.ZodError) {
     return fail(res, 400, error.issues[0]?.message ?? "Invalid request data");
@@ -684,7 +906,36 @@ if (fs.existsSync(webDist)) {
   });
 }
 
-app.listen(port, () => {
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  if (url.pathname !== "/ws/asr") {
+    socket.destroy();
+    return;
+  }
+
+  const currentTeacherId = teacherIdFromUpgrade(req);
+  const taskId = url.searchParams.get("taskId") ?? "";
+  if (!currentTeacherId || !taskId) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  try {
+    getTaskForTeacher(taskId, currentTeacherId);
+  } catch {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  (req as AsrUpgradeRequest).asrContext = { teacherId: currentTeacherId, taskId };
+  asrWss.handleUpgrade(req, socket, head, (ws) => {
+    asrWss.emit("connection", ws, req);
+  });
+});
+
+server.listen(port, () => {
   console.log(`Workbook API listening on http://localhost:${port}`);
 });
 

@@ -256,7 +256,8 @@ select:focus {
 
 .toast,
 .notice,
-.form-error {
+.form-error,
+.asr-status {
   border-radius: 8px;
   padding: 10px 12px;
   margin-bottom: 12px;
@@ -269,6 +270,19 @@ select:focus {
   margin: 14px 0 0;
   background: var(--red-soft);
   color: var(--red);
+}
+
+.asr-status {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 0;
+  background: #e9e1d2;
+  color: var(--ink);
+}
+
+.asr-status span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .hero-band,

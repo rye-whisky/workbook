@@ -18,7 +18,7 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { TaskStats, VoiceMatchResult } from "@workbook/shared";
+import type { AsrServerEvent, TaskStats, VoiceMatchResult } from "@workbook/shared";
 import { DEFAULT_SUBJECTS } from "@workbook/shared";
 
 type Tab = "home" | "students" | "tasks" | "collect" | "settings";
@@ -123,34 +123,8 @@ const DEFAULT_REGISTER: {
 
 declare global {
   interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
   }
-}
-
-interface SpeechRecognitionConstructor {
-  new (): SpeechRecognitionInstance;
-}
-
-interface SpeechRecognitionInstance {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-}
-
-interface SpeechRecognitionEventLike {
-  resultIndex: number;
-  results: ArrayLike<{
-    isFinal: boolean;
-    0: {
-      transcript: string;
-    };
-  }>;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -168,6 +142,41 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function cx(...classes: Array<string | false | undefined>) {
   return classes.filter(Boolean).join(" ");
+}
+
+function asrWebSocketUrl(taskId: string) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws/asr?taskId=${encodeURIComponent(taskId)}`;
+}
+
+function downsampleTo16k(input: Float32Array, inputSampleRate: number) {
+  const targetSampleRate = 16000;
+  if (inputSampleRate === targetSampleRate) {
+    return input;
+  }
+  const ratio = inputSampleRate / targetSampleRate;
+  const outputLength = Math.floor(input.length / ratio);
+  const output = new Float32Array(outputLength);
+  for (let i = 0; i < outputLength; i += 1) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(Math.floor((i + 1) * ratio), input.length);
+    let sum = 0;
+    for (let j = start; j < end; j += 1) {
+      sum += input[j];
+    }
+    output[i] = sum / Math.max(1, end - start);
+  }
+  return output;
+}
+
+function floatToPcm16(input: Float32Array) {
+  const buffer = new ArrayBuffer(input.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < input.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, input[i]));
+    view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return buffer;
 }
 
 function formatDate(input: string) {
@@ -868,10 +877,16 @@ function CollectView(props: {
 }) {
   const [manualName, setManualName] = useState("");
   const [listening, setListening] = useState(false);
+  const [asrStatus, setAsrStatus] = useState("未开始");
+  const [partialText, setPartialText] = useState("");
   const [pending, setPending] = useState<PendingMatch[]>([]);
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const task = props.task;
-  const recognitionSupported = typeof window !== "undefined" && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const microphoneSupported = typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
 
   const submitted = task?.submissions.filter((item) => item.status === "submitted") ?? [];
   const missing = task?.submissions.filter((item) => item.status === "missing") ?? [];
@@ -892,31 +907,122 @@ function CollectView(props: {
     [props]
   );
 
-  function startVoice() {
-    if (!recognitionSupported || !props.selectedTaskId) return;
-    const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    if (!Recognition) return;
-    const recognition = new Recognition();
-    recognition.lang = "zh-CN";
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          sendVoiceText(result[0].transcript).catch(() => undefined);
-        }
+  const stopAudio = useCallback(() => {
+    processorRef.current?.disconnect();
+    workletNodeRef.current?.disconnect();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    audioContextRef.current?.close().catch(() => undefined);
+    processorRef.current = null;
+    workletNodeRef.current = null;
+    streamRef.current = null;
+    audioContextRef.current = null;
+  }, []);
+
+  const handleAsrEvent = useCallback(
+    async (event: AsrServerEvent) => {
+      if (event.type === "ready") {
+        setAsrStatus(`已连接：${event.provider}`);
+        return;
       }
-    };
-    recognition.onend = () => setListening(false);
-    recognition.onerror = () => setListening(false);
-    recognitionRef.current = recognition;
-    recognition.start();
-    setListening(true);
+      if (event.type === "status") {
+        setAsrStatus(event.message);
+        return;
+      }
+      if (event.type === "partial") {
+        setPartialText(event.text);
+        setAsrStatus("识别中");
+        return;
+      }
+      if (event.type === "final" || event.type === "pending") {
+        setPartialText("");
+        setAsrStatus(event.type === "final" ? `已识别：${event.text}` : `待确认：${event.text}`);
+        if (event.match.needsConfirmation) {
+          setPending((current) => [{ id: `${Date.now()}-${event.text}`, match: event.match }, ...current].slice(0, 8));
+        }
+        await props.onRefreshTask(props.selectedTaskId);
+        return;
+      }
+      if (event.type === "error") {
+        setAsrStatus(event.message);
+        return;
+      }
+      if (event.type === "closed") {
+        setAsrStatus("录音已结束");
+      }
+    },
+    [props]
+  );
+
+  async function startVoice() {
+    if (!props.selectedTaskId) {
+      setAsrStatus("请先选择作业任务");
+      return;
+    }
+    if (!microphoneSupported) {
+      setAsrStatus("当前浏览器不支持麦克风录音，请使用手动输入");
+      return;
+    }
+    try {
+      setAsrStatus("请求麦克风权限");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(stream);
+      const ws = new WebSocket(asrWebSocketUrl(props.selectedTaskId));
+
+      streamRef.current = stream;
+      audioContextRef.current = audioContext;
+      wsRef.current = ws;
+
+      const sendSamples = (samples: Float32Array) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const pcm = floatToPcm16(downsampleTo16k(samples, audioContext.sampleRate));
+        ws.send(pcm);
+      };
+
+      ws.binaryType = "arraybuffer";
+      ws.onopen = async () => {
+        ws.send(JSON.stringify({ type: "start" }));
+        setAsrStatus("录音中");
+        setListening(true);
+        if (audioContext.audioWorklet) {
+          await audioContext.audioWorklet.addModule("/audio-recorder-worklet.js");
+          const node = new AudioWorkletNode(audioContext, "workbook-audio-recorder");
+          node.port.onmessage = (event: MessageEvent<Float32Array>) => sendSamples(event.data);
+          source.connect(node);
+          node.connect(audioContext.destination);
+          workletNodeRef.current = node;
+        } else {
+          const processor = audioContext.createScriptProcessor(4096, 1, 1);
+          processor.onaudioprocess = (event) => sendSamples(event.inputBuffer.getChannelData(0));
+          source.connect(processor);
+          processor.connect(audioContext.destination);
+          processorRef.current = processor;
+        }
+      };
+      ws.onmessage = (message) => {
+        try {
+          handleAsrEvent(JSON.parse(message.data as string) as AsrServerEvent).catch(() => undefined);
+        } catch {
+          setAsrStatus("ASR 响应格式错误");
+        }
+      };
+      ws.onerror = () => setAsrStatus("语音连接失败");
+      ws.onclose = () => {
+        stopAudio();
+        setListening(false);
+      };
+    } catch (error) {
+      stopAudio();
+      setListening(false);
+      setAsrStatus(error instanceof Error ? error.message : "无法开始录音");
+    }
   }
 
   function stopVoice() {
-    recognitionRef.current?.stop();
+    wsRef.current?.send(JSON.stringify({ type: "stop" }));
+    window.setTimeout(() => wsRef.current?.close(), 600);
+    stopAudio();
     setListening(false);
   }
 
@@ -961,9 +1067,9 @@ function CollectView(props: {
           </div>
 
           <div className="voice-dock">
-            <button className={cx("voice-button", listening && "recording")} onClick={listening ? stopVoice : startVoice} disabled={!recognitionSupported}>
+            <button className={cx("voice-button", listening && "recording")} onClick={listening ? stopVoice : startVoice}>
               {listening ? <Pause size={28} /> : <Mic size={28} />}
-              <span>{listening ? "暂停" : "语音"}</span>
+              <span>{listening ? "结束录音" : "开始录音"}</span>
             </button>
             <form
               className="manual-name"
@@ -982,7 +1088,11 @@ function CollectView(props: {
             </form>
           </div>
 
-          {!recognitionSupported ? <div className="notice">当前浏览器不支持语音识别，请使用手动输入。</div> : null}
+          <div className="asr-status">
+            <strong>{asrStatus}</strong>
+            {partialText ? <span>正在识别：{partialText}</span> : null}
+            {!microphoneSupported ? <span>当前浏览器不支持麦克风录音，请使用手动输入。</span> : null}
+          </div>
 
           {pending.length > 0 ? (
             <section className="section-block">

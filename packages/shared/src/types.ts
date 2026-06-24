@@ -37,3 +37,19 @@ export interface TaskStats {
   pending: number;
   total: number;
 }
+
+export type AsrProvider = "disabled" | "browser" | "volcengine" | "mock";
+
+export type AsrClientEvent =
+  | { type: "start" }
+  | { type: "stop" }
+  | { type: "mock-final"; text: string };
+
+export type AsrServerEvent =
+  | { type: "ready"; provider: AsrProvider }
+  | { type: "status"; message: string }
+  | { type: "partial"; text: string }
+  | { type: "final"; text: string; match: VoiceMatchResult; stats: TaskStats }
+  | { type: "pending"; text: string; match: VoiceMatchResult; stats: TaskStats }
+  | { type: "error"; message: string }
+  | { type: "closed" };
