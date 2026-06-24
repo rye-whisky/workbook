@@ -3,7 +3,7 @@ import { z } from "zod";
 export const teacherRegisterSchema = z.object({
   name: z.string().trim().min(2, "请输入教师姓名"),
   username: z.string().trim().min(3, "账号至少 3 个字符"),
-  password: z.string().min(6, "密码至少 6 位"),
+  password: z.string().min(8, "密码至少 8 位"),
   subjectName: z.string().trim().min(1, "请选择或填写学科")
 });
 

@@ -1004,6 +1004,7 @@ function CollectView(props: {
   const wsRef = useRef<WebSocket | null>(null);
   const voiceStartingRef = useRef(false);
   const recognizedInSessionRef = useRef(false);
+  const audioFrameCountRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1105,7 +1106,13 @@ function CollectView(props: {
         return;
       }
       if (event.type === "closed") {
-        setAsrStatus(recognizedInSessionRef.current ? "录音已结束，名单已刷新" : "录音已结束，未收到识别文本");
+        setAsrStatus((current) =>
+          recognizedInSessionRef.current
+            ? "录音已结束，名单已刷新"
+            : current.startsWith("未收到识别文本；")
+              ? current
+              : "录音已结束，未收到识别文本"
+        );
       }
     },
     [props]
@@ -1132,10 +1139,12 @@ function CollectView(props: {
     try {
       voiceStartingRef.current = true;
       recognizedInSessionRef.current = false;
+      audioFrameCountRef.current = 0;
       setAsrStatus("请求麦克风权限");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       const audioContext = new AudioContextClass();
+      await audioContext.resume().catch(() => undefined);
       const source = audioContext.createMediaStreamSource(stream);
       const ws = new WebSocket(asrWebSocketUrl(props.selectedTaskId));
 
@@ -1146,6 +1155,10 @@ function CollectView(props: {
       const sendSamples = (samples: Float32Array) => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const pcm = floatToPcm16(downsampleTo16k(samples, audioContext.sampleRate));
+        audioFrameCountRef.current += 1;
+        if (audioFrameCountRef.current === 1 || audioFrameCountRef.current % 50 === 0) {
+          setAsrStatus(`录音中，已采集 ${audioFrameCountRef.current} 段音频`);
+        }
         ws.send(pcm);
       };
 
@@ -1154,7 +1167,8 @@ function CollectView(props: {
         try {
           ws.send(JSON.stringify({ type: "start" }));
           voiceStartingRef.current = false;
-          setAsrStatus("录音中");
+          await audioContext.resume().catch(() => undefined);
+          setAsrStatus("录音中，正在采集音频");
           setListening(true);
           if (audioContext.audioWorklet) {
             await audioContext.audioWorklet.addModule("/audio-recorder-worklet.js");

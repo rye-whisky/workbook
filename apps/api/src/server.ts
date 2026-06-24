@@ -11,6 +11,7 @@ import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
 import jwt from "jsonwebtoken";
 import multer from "multer";
+import rateLimit from "express-rate-limit";
 import { createWorker } from "tesseract.js";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import * as XLSX from "xlsx";
@@ -50,6 +51,7 @@ interface AsrUpgradeRequest extends http.IncomingMessage {
 }
 
 const app = express();
+app.set("trust proxy", 1);
 const httpsCertFile = process.env.HTTPS_CERT_FILE;
 const httpsKeyFile = process.env.HTTPS_KEY_FILE;
 const server =
@@ -69,14 +71,56 @@ dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: false });
 const port = Number(process.env.PORT ?? 4100);
 const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
-const sessionSecret = process.env.SESSION_SECRET ?? "dev-only-change-me";
+function resolveSessionSecret(): string {
+  const secret = process.env.SESSION_SECRET;
+  const isDev = process.env.NODE_ENV === "development";
+  const weakValues = ["", "dev-only-change-me", "replace-with-a-long-random-secret"];
+  if (!secret || secret.length < 32 || weakValues.includes(secret)) {
+    if (isDev) {
+      return "dev-only-change-me";
+    }
+    throw new Error(
+      "SESSION_SECRET 未配置或强度不足（需至少 32 位随机字符）。请在 .env 中设置一个强随机值后重启服务。"
+    );
+  }
+  return secret;
+}
+
+const sessionSecret = resolveSessionSecret();
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "uploads");
 const secureCookies = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === "true"
   : webOrigin.startsWith("https://");
 const asrProvider = (process.env.ASR_PROVIDER ?? "disabled") as AsrProvider;
 const asrMockText = process.env.ASR_MOCK_TEXT ?? "张三";
-const maxAsrConcurrency = Number(process.env.ASR_MAX_CONCURRENCY ?? 1);
+const maxAsrConcurrency = envPositiveInt("ASR_MAX_CONCURRENCY", 1);
+const maxOcrConcurrency = envPositiveInt("OCR_MAX_CONCURRENCY", 1);
+let activeOcrJobs = 0;
+const ocrWaiters: Array<() => void> = [];
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  return parsed;
+}
+
+// Bounds concurrent OCR jobs (each spawns a heavy tesseract worker + language data)
+// so parallel image uploads cannot exhaust memory/CPU.
+async function withOcrSlot<T>(task: () => Promise<T>): Promise<T> {
+  if (activeOcrJobs >= maxOcrConcurrency) {
+    await new Promise<void>((resolve) => ocrWaiters.push(resolve));
+  }
+  activeOcrJobs += 1;
+  try {
+    return await task();
+  } finally {
+    activeOcrJobs -= 1;
+    const next = ocrWaiters.shift();
+    if (next) next();
+  }
+}
 const defaultVolcengineAsrEndpoint = "wss://openspeech.bytedance.com/api/v2/asr";
 
 const volcengineProtocolVersion = 0x1;
@@ -103,12 +147,39 @@ const upload = multer({
   limits: { fileSize: 8 * 1024 * 1024 }
 });
 
+// Precomputed hash so that a login attempt for a non-existent username still pays
+// the full bcrypt cost, removing a username-enumeration timing oracle.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync("workbook-timing-dummy", 12);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.status(429).json({ data: null, error: "登录尝试过于频繁，请 15 分钟后再试" });
+  }
+});
+
 function ok<T>(res: Response<ApiEnvelope<T>>, data: T) {
   return res.json({ data, error: null });
 }
 
 function fail(res: Response<ApiEnvelope<never>>, status: number, error: string) {
   return res.status(status).json({ data: null, error });
+}
+
+class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function notFound(message: string) {
+  return new ApiError(404, message);
 }
 
 function teacherId(req: AuthRequest) {
@@ -332,7 +403,7 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
     currentTeacherId
   );
   if (!row) {
-    throw new Error("作业任务不存在或无权访问");
+    throw notFound("作业任务不存在或无权访问");
   }
   return camelTask(row);
 }
@@ -515,10 +586,10 @@ function formatVolcengineAsrError(code: number | undefined, error: string) {
   return `火山引擎 ASR 错误${code ? ` ${code}` : ""}：${error}`;
 }
 
-function ensureClass(_currentTeacherId: string, gradeId: string, classId: string) {
+function ensureClass(gradeId: string, classId: string) {
   const classroom = one("SELECT id FROM classrooms WHERE id = ? AND grade_id = ? AND deleted_at IS NULL", classId, gradeId);
   if (!classroom) {
-    throw new Error("班级不存在或无权访问");
+    throw notFound("班级不存在或无权访问");
   }
 }
 
@@ -549,7 +620,7 @@ app.use(cors({ origin: webOrigin, credentials: true }));
 
 app.get("/api/health", (_req, res) => ok(res, { status: "ok" }));
 
-app.post("/api/auth/register", async (req, res, next) => {
+app.post("/api/auth/register", authLimiter, async (req, res, next) => {
   try {
     const input = teacherRegisterSchema.parse(req.body);
     const timestamp = nowIso();
@@ -570,13 +641,12 @@ app.post("/api/auth/register", async (req, res, next) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res, next) => {
+app.post("/api/auth/login", authLimiter, async (req, res, next) => {
   try {
     const input = loginSchema.parse(req.body);
     const teacher = one("SELECT * FROM teachers WHERE username = ?", input.username);
-    if (!teacher) return fail(res, 401, "Invalid username or password");
-    const passwordOk = await bcrypt.compare(input.password, String(teacher.password_hash));
-    if (!passwordOk) return fail(res, 401, "Invalid username or password");
+    const passwordOk = await bcrypt.compare(input.password, teacher ? String(teacher.password_hash) : DUMMY_PASSWORD_HASH);
+    if (!teacher || !passwordOk) return fail(res, 401, "账号或密码错误");
     setSessionCookie(res, signSession(String(teacher.id)));
     return ok(res, camelTeacher(teacher));
   } catch (error) {
@@ -636,19 +706,21 @@ app.post("/api/grades", requireAuth, (req: AuthRequest, res, next) => {
 app.patch("/api/grades/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = namedEntitySchema.parse(req.body);
-    run("UPDATE grades SET name = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, nowIso(), routeParam(req, "id"));
-    return ok(res, camelGrade(one("SELECT * FROM grades WHERE id = ?", routeParam(req, "id"))!));
+    const id = routeParam(req, "id");
+    run("UPDATE grades SET name = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, nowIso(), id);
+    return ok(res, camelGrade(one("SELECT * FROM grades WHERE id = ?", id)!));
   } catch (error) {
     return next(error);
   }
 });
 app.delete("/api/grades/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
-    const activeClass = one("SELECT id FROM classrooms WHERE grade_id = ? AND deleted_at IS NULL", routeParam(req, "id"));
+    const id = routeParam(req, "id");
+    const activeClass = one("SELECT id FROM classrooms WHERE grade_id = ? AND deleted_at IS NULL", id);
     if (activeClass) {
-      throw new Error("该年级下仍有班级，不能删除");
+      throw new ApiError(409, "该年级下仍有班级，不能删除");
     }
-    run("UPDATE grades SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
+    run("UPDATE grades SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), id);
   } catch (error) {
     return next(error);
   }
@@ -660,7 +732,7 @@ app.post("/api/classes", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = classSchema.parse(req.body);
     if (!one("SELECT id FROM grades WHERE id = ? AND deleted_at IS NULL", input.gradeId)) {
-      throw new Error("年级不存在或无权访问");
+      throw notFound("年级不存在或无权访问");
     }
     const existing = one("SELECT * FROM classrooms WHERE grade_id = ? AND name = ?", input.gradeId, input.name);
     if (existing) {
@@ -680,15 +752,24 @@ app.post("/api/classes", requireAuth, (req: AuthRequest, res, next) => {
 app.patch("/api/classes/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = classSchema.parse(req.body);
-    run("UPDATE classrooms SET name = ?, grade_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.gradeId, nowIso(), routeParam(req, "id"));
-    return ok(res, getClasses().find((item) => item.id === routeParam(req, "id")));
+    const id = routeParam(req, "id");
+    if (!one("SELECT id FROM grades WHERE id = ? AND deleted_at IS NULL", input.gradeId)) {
+      throw notFound("年级不存在或无权访问");
+    }
+    run("UPDATE classrooms SET name = ?, grade_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.gradeId, nowIso(), id);
+    return ok(res, getClasses().find((item) => item.id === id));
   } catch (error) {
     return next(error);
   }
 });
-app.delete("/api/classes/:id", requireAuth, (req: AuthRequest, res) => {
-  run("UPDATE classrooms SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
-  return ok(res, { success: true });
+app.delete("/api/classes/:id", requireAuth, (req: AuthRequest, res, next) => {
+  try {
+    const id = routeParam(req, "id");
+    run("UPDATE classrooms SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), id);
+    return ok(res, { success: true });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 app.get("/api/subjects", requireAuth, (req: AuthRequest, res) => ok(res, getSubjects(teacherId(req))));
@@ -725,7 +806,7 @@ app.post("/api/students", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = studentSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
-    ensureClass(currentTeacherId, input.gradeId, input.classId);
+    ensureClass(input.gradeId, input.classId);
     const existing = one("SELECT * FROM students WHERE class_id = ? AND name = ?", input.classId, input.name);
     if (existing) {
       if (existing.deleted_at) {
@@ -747,18 +828,23 @@ app.post("/api/students", requireAuth, (req: AuthRequest, res, next) => {
 app.patch("/api/students/:id", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = studentSchema.parse(req.body);
-    const currentTeacherId = teacherId(req);
-    ensureClass(currentTeacherId, input.gradeId, input.classId);
-    const existing = one<{ display_order?: number }>("SELECT display_order FROM students WHERE id = ?", routeParam(req, "id"));
-    run("UPDATE students SET name = ?, student_no = ?, aliases = ?, grade_id = ?, class_id = ?, display_order = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.studentNo ?? null, JSON.stringify(input.aliases), input.gradeId, input.classId, input.displayOrder ?? Number(existing?.display_order ?? 0), nowIso(), routeParam(req, "id"));
-    return ok(res, getStudents().find((item) => item.id === routeParam(req, "id")));
+    const id = routeParam(req, "id");
+    ensureClass(input.gradeId, input.classId);
+    const existing = one<{ display_order?: number }>("SELECT display_order FROM students WHERE id = ?", id);
+    run("UPDATE students SET name = ?, student_no = ?, aliases = ?, grade_id = ?, class_id = ?, display_order = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", input.name, input.studentNo ?? null, JSON.stringify(input.aliases), input.gradeId, input.classId, input.displayOrder ?? Number(existing?.display_order ?? 0), nowIso(), id);
+    return ok(res, getStudents().find((item) => item.id === id));
   } catch (error) {
     return next(error);
   }
 });
-app.delete("/api/students/:id", requireAuth, (req: AuthRequest, res) => {
-  run("UPDATE students SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), routeParam(req, "id"));
-  return ok(res, { success: true });
+app.delete("/api/students/:id", requireAuth, (req: AuthRequest, res, next) => {
+  try {
+    const id = routeParam(req, "id");
+    run("UPDATE students SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", nowIso(), nowIso(), id);
+    return ok(res, { success: true });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 app.patch("/api/classes/:id/students/order", requireAuth, (req: AuthRequest, res, next) => {
@@ -766,7 +852,7 @@ app.patch("/api/classes/:id/students/order", requireAuth, (req: AuthRequest, res
     const input = studentOrderSchema.parse(req.body);
     const classId = routeParam(req, "id");
     if (!one("SELECT id FROM classrooms WHERE id = ? AND deleted_at IS NULL", classId)) {
-      throw new Error("班级不存在或已删除");
+      throw notFound("班级不存在或已删除");
     }
     withTransaction(() => {
       input.studentIds.forEach((studentId, index) => {
@@ -784,9 +870,9 @@ app.post("/api/homework-tasks", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = homeworkTaskSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
-    ensureClass(currentTeacherId, input.gradeId, input.classId);
+    ensureClass(input.gradeId, input.classId);
     if (!one("SELECT id FROM subjects WHERE id = ? AND teacher_id = ?", input.subjectId, currentTeacherId)) {
-      throw new Error("学科不存在或无权访问");
+      throw notFound("学科不存在或无权访问");
     }
     const taskId = withTransaction(() => {
       const id = createId();
@@ -832,7 +918,7 @@ app.patch("/api/homework-tasks/:id", requireAuth, (req: AuthRequest, res, next) 
   try {
     const input = homeworkTaskSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
-    ensureClass(currentTeacherId, input.gradeId, input.classId);
+    ensureClass(input.gradeId, input.classId);
     const grade = one("SELECT name FROM grades WHERE id = ?", input.gradeId);
     const classroom = one("SELECT name FROM classrooms WHERE id = ?", input.classId);
     const subject = one("SELECT name FROM subjects WHERE id = ?", input.subjectId);
@@ -908,9 +994,16 @@ app.post("/api/imports/roster-file", requireAuth, upload.single("file"), async (
 app.post("/api/imports/roster-ocr", requireAuth, upload.single("file"), async (req: AuthRequest, res, next) => {
   try {
     if (!req.file) return fail(res, 400, "请上传花名册图片");
-    const worker = await createWorker("chi_sim+eng");
-    const result = await worker.recognize(req.file.path);
-    await worker.terminate();
+    const filePath = req.file.path;
+    const originalName = req.file.originalname;
+    const result = await withOcrSlot(async () => {
+      const worker = await createWorker("chi_sim+eng");
+      try {
+        return await worker.recognize(filePath);
+      } finally {
+        await worker.terminate();
+      }
+    });
     const rawText = result.data.text;
     const rows = rawText
       .split(/\r?\n/)
@@ -921,10 +1014,10 @@ app.post("/api/imports/roster-ocr", requireAuth, upload.single("file"), async (r
         const name = maybeName ?? studentNoOrName;
         return name && name.length >= 2 ? [{ name, studentNo: maybeName ? studentNoOrName : null, aliases: [] }] : [];
       });
-    await fs.promises.unlink(req.file.path).catch(() => undefined);
+    await fs.promises.unlink(filePath).catch(() => undefined);
     const id = createId();
     const timestamp = nowIso();
-    run("INSERT INTO import_batches (id, source, original_name, raw_text, parsed_rows, teacher_id, created_at, updated_at) VALUES (?, 'ocr', ?, ?, ?, ?, ?, ?)", id, req.file.originalname, rawText, JSON.stringify(rows), teacherId(req), timestamp, timestamp);
+    run("INSERT INTO import_batches (id, source, original_name, raw_text, parsed_rows, teacher_id, created_at, updated_at) VALUES (?, 'ocr', ?, ?, ?, ?, ?, ?)", id, originalName, rawText, JSON.stringify(rows), teacherId(req), timestamp, timestamp);
     return ok(res, { batchId: id, rawText, rows });
   } catch (error) {
     return next(error);
@@ -935,9 +1028,9 @@ app.post("/api/imports/:id/commit", requireAuth, (req: AuthRequest, res, next) =
   try {
     const input = importCommitSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
-    ensureClass(currentTeacherId, input.gradeId, input.classId);
+    ensureClass(input.gradeId, input.classId);
     if (!one("SELECT id FROM import_batches WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), currentTeacherId)) {
-      throw new Error("导入批次不存在或无权访问");
+      throw notFound("导入批次不存在或无权访问");
     }
     let created = 0;
     let skipped = 0;
@@ -988,6 +1081,14 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   let lastProviderText = "";
   let lastMatchedText = "";
   let finalizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let upstreamReadyForAudio = false;
+  let audioChunksReceived = 0;
+  let audioBytesReceived = 0;
+  let audioChunksSent = 0;
+  let audioBytesSent = 0;
+  let stopFramePending = false;
+  const pendingAudioChunks: Buffer[] = [];
+  const maxPendingAudioBytes = 1024 * 1024 * 2;
 
   function closeUpstream() {
     if (finalizeTimer) {
@@ -1000,6 +1101,42 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       socket.close();
     }
     activeAsrClients.delete(ws);
+  }
+
+  function queueAudioChunk(chunk: Buffer) {
+    const queuedBytes = pendingAudioChunks.reduce((total, item) => total + item.length, 0);
+    if (queuedBytes + chunk.length <= maxPendingAudioBytes) {
+      pendingAudioChunks.push(chunk);
+    }
+  }
+
+  function sendAudioToProvider(chunk: Buffer, last: boolean) {
+    if (upstream?.readyState !== WebSocket.OPEN || !upstreamReadyForAudio) {
+      if (!last && chunk.length > 0) {
+        queueAudioChunk(chunk);
+      } else if (last) {
+        stopFramePending = true;
+      }
+      return;
+    }
+    upstream.send(buildVolcengineAudioRequest(chunk, last));
+    if (!last) {
+      audioChunksSent += 1;
+      audioBytesSent += chunk.length;
+    }
+  }
+
+  function flushQueuedAudio() {
+    while (pendingAudioChunks.length > 0) {
+      const chunk = pendingAudioChunks.shift();
+      if (chunk) {
+        sendAudioToProvider(chunk, false);
+      }
+    }
+    if (stopFramePending) {
+      stopFramePending = false;
+      sendAudioToProvider(Buffer.alloc(0), true);
+    }
   }
 
   function closeClientSoon() {
@@ -1023,6 +1160,12 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     }
     if (useLastTextFallback && lastProviderText && lastProviderText !== lastMatchedText) {
       handleFinalText(lastProviderText);
+    }
+    if (!lastProviderText) {
+      sendAsr(ws, {
+        type: "status",
+        message: `未收到识别文本；浏览器音频 ${audioChunksReceived} 段/${audioBytesReceived} 字节，已转发 ${audioChunksSent} 段/${audioBytesSent} 字节`
+      });
     }
     sendAsr(ws, { type: "closed" });
     closeUpstream();
@@ -1080,7 +1223,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
           },
           audio: {
             format: process.env.VOLCENGINE_ASR_FORMAT ?? "pcm",
-            rate: Number(process.env.VOLCENGINE_ASR_SAMPLE_RATE ?? 16000),
+            rate: envPositiveInt("VOLCENGINE_ASR_SAMPLE_RATE", 16000),
             language: process.env.VOLCENGINE_ASR_LANGUAGE ?? "zh-CN",
             bits: 16,
             channel: 1,
@@ -1088,7 +1231,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
           }
         })
       );
-      sendAsr(ws, { type: "ready", provider: "volcengine" });
+      sendAsr(ws, { type: "status", message: "火山 ASR 已连接，正在初始化识别通道" });
     });
 
     providerSocket.on("message", (message) => {
@@ -1098,6 +1241,11 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
           sendAsr(ws, { type: "error", message: formatVolcengineAsrError(response.code, response.error) });
           finishAsrSession(false);
           return;
+        }
+        if (!upstreamReadyForAudio) {
+          upstreamReadyForAudio = true;
+          sendAsr(ws, { type: "ready", provider: "volcengine" });
+          flushQueuedAudio();
         }
         if (response.text && response.type === "final") {
           lastProviderText = response.text.trim();
@@ -1145,8 +1293,11 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
   ws.on("message", (message: RawData, isBinary) => {
     if (isBinary) {
-      if (asrProvider === "volcengine" && upstream?.readyState === WebSocket.OPEN) {
-        upstream.send(buildVolcengineAudioRequest(rawDataToBuffer(message), false));
+      if (asrProvider === "volcengine") {
+        const chunk = rawDataToBuffer(message);
+        audioChunksReceived += 1;
+        audioBytesReceived += chunk.length;
+        sendAudioToProvider(chunk, false);
       }
       return;
     }
@@ -1199,8 +1350,12 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
         finishAsrSession(false);
       } else if (upstream?.readyState === WebSocket.OPEN) {
         stopRequested = true;
-        sendAsr(ws, { type: "status", message: "录音已停止，正在等待识别结果" });
-        upstream.send(buildVolcengineAudioRequest(Buffer.alloc(0), true));
+        sendAsr(ws, {
+          type: "status",
+          message: `录音已停止，收到 ${audioChunksReceived} 段音频，正在等待识别结果`
+        });
+        flushQueuedAudio();
+        sendAudioToProvider(Buffer.alloc(0), true);
         finalizeTimer = setTimeout(() => {
           finishAsrSession(true);
         }, 10000);
@@ -1217,15 +1372,19 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
 app.use((error: unknown, _req: Request, res: Response<ApiEnvelope<never>>, _next: NextFunction) => {
   if (error instanceof z.ZodError) {
-    return fail(res, 400, error.issues[0]?.message ?? "Invalid request data");
+    return fail(res, 400, error.issues[0]?.message ?? "请求参数有误");
+  }
+  if (error instanceof ApiError) {
+    return fail(res, error.status, error.message);
   }
   if (error instanceof Error) {
     if (/UNIQUE constraint failed/.test(error.message)) {
       return fail(res, 409, "数据已存在，请检查账号、班级、学生或学科是否重复");
     }
-    return fail(res, 500, error.message);
+    console.error("[workbook] 未处理的错误:", error);
+    return fail(res, 500, "服务器内部错误，请稍后重试");
   }
-  return fail(res, 500, "Server error");
+  return fail(res, 500, "服务器内部错误，请稍后重试");
 });
 
 const webDist = path.resolve(__dirname, "../../web/dist");

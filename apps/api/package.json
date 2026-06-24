@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsup && node scripts/fix-node-sqlite.mjs",
@@ -19,11 +22,12 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.5.2",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
     "tesseract.js": "^6.0.1",
     "ws": "^8.21.0",
-    "xlsx": "^0.18.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zod": "^4.1.13"
   },
   "devDependencies": {
