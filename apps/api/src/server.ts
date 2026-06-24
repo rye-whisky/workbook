@@ -567,6 +567,22 @@ function parseVolcengineResponse(message: RawData) {
   if (serialization === volcengineSerializationJson && rawPayload) {
     data = JSON.parse(rawPayload) as Record<string, unknown>;
   }
+  const payloadCode = typeof data?.code === "number" ? data.code : code;
+  const payloadErrorMessage =
+    typeof data?.message === "string"
+      ? data.message
+      : typeof data?.Message === "string"
+        ? data.Message
+        : rawPayload;
+
+  if (messageType !== volcengineMessageType.serverError && payloadCode !== undefined && payloadCode !== 1000) {
+    return {
+      type: "error",
+      text: "",
+      error: payloadErrorMessage || rawPayload,
+      code: payloadCode
+    };
+  }
 
   const findText = (value: unknown): string => {
     if (typeof value === "string") return value;
@@ -595,14 +611,20 @@ function parseVolcengineResponse(message: RawData) {
   return {
     type: messageType === volcengineMessageType.serverError ? "error" : isFinal ? "final" : "partial",
     text,
-    error: rawPayload,
-    code
+    error: messageType === volcengineMessageType.serverError ? payloadErrorMessage || rawPayload : rawPayload,
+    code: payloadCode
   };
 }
 
 function formatVolcengineAsrError(code: number | undefined, error: string) {
   if (code === 45000292 || /quota exceeded|concurrency/i.test(error)) {
     return "火山引擎流式识别并发额度已用完，请等待上一段录音释放后再试；如果仍然出现，需要在火山控制台提升流式识别并发额度。";
+  }
+  if (code === 1020 || /response code 1020/i.test(error)) {
+    return `火山引擎 ASR 初始化失败 1020：${error}。通常是请求参数、音频格式、cluster 或账号权限不匹配。`;
+  }
+  if (code === 1013 || /No valid speeches/i.test(error)) {
+    return "火山引擎没有检测到有效人声，请确认录音时说话声音足够清晰、麦克风权限已允许，并尽量靠近手机麦克风。";
   }
   return `火山引擎 ASR 错误${code ? ` ${code}` : ""}：${error}`;
 }
@@ -1275,7 +1297,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       try {
         const response = parseVolcengineResponse(message);
         if (response.type === "error") {
-          sendAsr(ws, { type: "error", message: formatVolcengineAsrError(response.code, response.error) });
+          sendAsr(ws, { type: "error", message: formatVolcengineAsrError(response.code, String(response.error)) });
           finishAsrSession(false);
           return;
         }
