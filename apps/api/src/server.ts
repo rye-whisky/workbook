@@ -476,15 +476,23 @@ function parseVolcengineResponse(message: RawData) {
     data = JSON.parse(rawPayload) as Record<string, unknown>;
   }
 
-  const result = data?.result as Record<string, unknown> | undefined;
-  const text =
-    typeof data?.text === "string"
-      ? data.text
-      : typeof data?.result === "string"
-        ? data.result
-        : typeof result?.text === "string"
-          ? result.text
-          : "";
+  const findText = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    if (!value || typeof value !== "object") return "";
+    if (Array.isArray(value)) {
+      return value.map(findText).filter(Boolean).join(" ");
+    }
+    const record = value as Record<string, unknown>;
+    for (const key of ["text", "utterance", "transcript", "sentence"]) {
+      if (typeof record[key] === "string") return String(record[key]);
+    }
+    for (const key of ["result", "results", "utterances", "sentences"]) {
+      const nested = findText(record[key]);
+      if (nested) return nested;
+    }
+    return "";
+  };
+  const text = findText(data);
   const isFinal =
     flags === volcengineMessageFlags.negativeSequence ||
     sequence !== undefined && sequence < 0 ||
@@ -975,8 +983,17 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
   let upstream: WebSocket | null = null;
   let started = false;
+  let stopRequested = false;
+  let finished = false;
+  let lastProviderText = "";
+  let lastMatchedText = "";
+  let finalizeTimer: ReturnType<typeof setTimeout> | null = null;
 
   function closeUpstream() {
+    if (finalizeTimer) {
+      clearTimeout(finalizeTimer);
+      finalizeTimer = null;
+    }
     const socket = upstream;
     upstream = null;
     if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
@@ -985,11 +1002,39 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     activeAsrClients.delete(ws);
   }
 
+  function closeClientSoon() {
+    if (ws.readyState === WebSocket.OPEN) {
+      setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "ASR session finished");
+        }
+      }, 100);
+    }
+  }
+
+  function finishAsrSession(useLastTextFallback: boolean) {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    if (finalizeTimer) {
+      clearTimeout(finalizeTimer);
+      finalizeTimer = null;
+    }
+    if (useLastTextFallback && lastProviderText && lastProviderText !== lastMatchedText) {
+      handleFinalText(lastProviderText);
+    }
+    sendAsr(ws, { type: "closed" });
+    closeUpstream();
+    closeClientSoon();
+  }
+
   function handleFinalText(text: string) {
     const normalized = text.trim();
     if (!normalized) {
       return;
     }
+    lastMatchedText = normalized;
     try {
       const result = applyVoiceMatch(asrContext.taskId, asrContext.teacherId, normalized, "asr");
       const payload = {
@@ -1051,12 +1096,17 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
         const response = parseVolcengineResponse(message);
         if (response.type === "error") {
           sendAsr(ws, { type: "error", message: formatVolcengineAsrError(response.code, response.error) });
-          closeUpstream();
+          finishAsrSession(false);
           return;
         }
         if (response.text && response.type === "final") {
+          lastProviderText = response.text.trim();
           handleFinalText(response.text);
+          if (stopRequested) {
+            finishAsrSession(false);
+          }
         } else if (response.text) {
+          lastProviderText = response.text.trim();
           sendAsr(ws, { type: "partial", text: response.text });
         }
       } catch {
@@ -1066,6 +1116,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
     providerSocket.on("error", (error) => {
       sendAsr(ws, { type: "error", message: `火山引擎 ASR 连接失败：${error.message}` });
+      finishAsrSession(false);
     });
 
     providerSocket.on("close", (code, reason) => {
@@ -1073,10 +1124,17 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
         upstream = null;
       }
       activeAsrClients.delete(ws);
+      if (finished) {
+        return;
+      }
       if (ws.readyState === WebSocket.OPEN) {
         const detail = reason.length ? `，原因：${reason.toString()}` : "";
         sendAsr(ws, { type: "status", message: `火山引擎 ASR 连接已关闭：${code}${detail}` });
-        sendAsr(ws, { type: "closed" });
+        if (stopRequested) {
+          finishAsrSession(true);
+        } else {
+          sendAsr(ws, { type: "closed" });
+        }
       }
     });
 
@@ -1138,11 +1196,17 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     if (event.type === "stop") {
       if (asrProvider === "mock") {
         handleFinalText(event.text || asrMockText);
+        finishAsrSession(false);
       } else if (upstream?.readyState === WebSocket.OPEN) {
+        stopRequested = true;
+        sendAsr(ws, { type: "status", message: "录音已停止，正在等待识别结果" });
         upstream.send(buildVolcengineAudioRequest(Buffer.alloc(0), true));
+        finalizeTimer = setTimeout(() => {
+          finishAsrSession(true);
+        }, 10000);
+      } else {
+        finishAsrSession(true);
       }
-      sendAsr(ws, { type: "closed" });
-      closeUpstream();
       return;
     }
   });

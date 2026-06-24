@@ -1003,6 +1003,7 @@ function CollectView(props: {
   const [pending, setPending] = useState<PendingMatch[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const voiceStartingRef = useRef(false);
+  const recognizedInSessionRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1046,13 +1047,23 @@ function CollectView(props: {
   const closeVoiceSession = useCallback(
     (sendStop = true) => {
       const ws = wsRef.current;
-      wsRef.current = null;
       voiceStartingRef.current = false;
       if (sendStop && ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "stop" }));
       }
-      if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
-        window.setTimeout(() => ws.close(), sendStop ? 600 : 0);
+      if (!sendStop) {
+        wsRef.current = null;
+        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+          window.setTimeout(() => ws.close(), 0);
+        }
+      } else if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+        window.setTimeout(() => {
+          if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+            setAsrStatus("识别等待超时，请重试或使用手动输入");
+            wsRef.current = null;
+            ws.close();
+          }
+        }, 12000);
       }
       stopAudio();
       setListening(false);
@@ -1080,6 +1091,7 @@ function CollectView(props: {
         return;
       }
       if (event.type === "final" || event.type === "pending") {
+        recognizedInSessionRef.current = true;
         setPartialText("");
         setAsrStatus(event.type === "final" ? `已识别：${event.text}` : `待确认：${event.text}`);
         if (event.match.needsConfirmation) {
@@ -1093,7 +1105,7 @@ function CollectView(props: {
         return;
       }
       if (event.type === "closed") {
-        setAsrStatus("录音已结束");
+        setAsrStatus(recognizedInSessionRef.current ? "录音已结束，名单已刷新" : "录音已结束，未收到识别文本");
       }
     },
     [props]
@@ -1119,6 +1131,7 @@ function CollectView(props: {
     }
     try {
       voiceStartingRef.current = true;
+      recognizedInSessionRef.current = false;
       setAsrStatus("请求麦克风权限");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
