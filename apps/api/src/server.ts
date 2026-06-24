@@ -1,5 +1,6 @@
 ﻿import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -49,7 +50,18 @@ interface AsrUpgradeRequest extends http.IncomingMessage {
 }
 
 const app = express();
-const server = http.createServer(app);
+const httpsCertFile = process.env.HTTPS_CERT_FILE;
+const httpsKeyFile = process.env.HTTPS_KEY_FILE;
+const server =
+  httpsCertFile && httpsKeyFile
+    ? https.createServer(
+        {
+          cert: fs.readFileSync(httpsCertFile),
+          key: fs.readFileSync(httpsKeyFile)
+        },
+        app
+      )
+    : http.createServer(app);
 const asrWss = new WebSocketServer({ noServer: true });
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });

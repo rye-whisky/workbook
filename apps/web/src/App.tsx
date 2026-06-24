@@ -1007,7 +1007,10 @@ function CollectView(props: {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const task = props.task;
-  const microphoneSupported = typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
+  const isSecureRecordingContext =
+    typeof window !== "undefined" &&
+    (window.isSecureContext || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+  const microphoneSupported = isSecureRecordingContext && typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
 
   const submitted = task?.submissions.filter((item) => item.status === "submitted") ?? [];
   const missing = task?.submissions.filter((item) => item.status === "missing") ?? [];
@@ -1079,8 +1082,12 @@ function CollectView(props: {
       setAsrStatus("请先选择作业任务");
       return;
     }
+    if (!isSecureRecordingContext) {
+      setAsrStatus("当前页面不是 HTTPS，浏览器禁止麦克风录音。请使用 HTTPS 地址访问。");
+      return;
+    }
     if (!microphoneSupported) {
-      setAsrStatus("当前浏览器不支持麦克风录音，请使用手动输入");
+      setAsrStatus("当前浏览器没有开放麦克风录音能力，请检查权限或换用 Chrome/Edge/Safari");
       return;
     }
     try {
@@ -1212,7 +1219,8 @@ function CollectView(props: {
           <div className="asr-status">
             <strong>{asrStatus}</strong>
             {partialText ? <span>正在识别：{partialText}</span> : null}
-            {!microphoneSupported ? <span>当前浏览器不支持麦克风录音，请使用手动输入。</span> : null}
+            {!isSecureRecordingContext ? <span>公网 HTTP 页面不能录音，请改用 HTTPS 地址。</span> : null}
+            {isSecureRecordingContext && !microphoneSupported ? <span>当前浏览器没有开放麦克风录音能力，请检查权限。</span> : null}
           </div>
 
           {pending.length > 0 ? (
