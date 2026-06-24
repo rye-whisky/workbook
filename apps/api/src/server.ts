@@ -830,12 +830,14 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       }
     });
 
-    providerSocket.on("error", () => {
-      sendAsr(ws, { type: "error", message: "火山引擎 ASR 连接失败" });
+    providerSocket.on("error", (error) => {
+      sendAsr(ws, { type: "error", message: `火山引擎 ASR 连接失败：${error.message}` });
     });
 
-    providerSocket.on("close", () => {
+    providerSocket.on("close", (code, reason) => {
       if (ws.readyState === WebSocket.OPEN) {
+        const detail = reason.length ? `，原因：${reason.toString()}` : "";
+        sendAsr(ws, { type: "status", message: `火山引擎 ASR 连接已关闭：${code}${detail}` });
         sendAsr(ws, { type: "closed" });
       }
     });
