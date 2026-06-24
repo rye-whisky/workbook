@@ -22,8 +22,9 @@ import {
   homeworkTaskSchema,
   importCommitSchema,
   loginSchema,
-  matchStudentName,
+  matchStudentNameSequence,
   namedEntitySchema,
+  shouldLearnVoiceAlias,
   studentSchema,
   studentOrderSchema,
   submissionStatusSchema,
@@ -33,7 +34,8 @@ import {
   type AsrProvider,
   type AsrServerEvent,
   type StudentLite,
-  type TaskStats
+  type TaskStats,
+  type VoiceBatchMatchResult
 } from "@workbook/shared";
 import { createId, db, nowIso, parseJsonList, withTransaction } from "./db";
 
@@ -408,6 +410,18 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
   return camelTask(row);
 }
 
+function learnVoiceAlias(studentId: string, rawText: string | undefined) {
+  if (!rawText) return;
+  const alias = shouldLearnVoiceAlias(rawText);
+  if (!alias) return;
+  const student = one("SELECT name, aliases FROM students WHERE id = ? AND deleted_at IS NULL", studentId);
+  if (!student) return;
+  if (alias === String(student.name)) return;
+  const aliases = parseJsonList(student.aliases);
+  if (aliases.includes(alias)) return;
+  run("UPDATE students SET aliases = ?, updated_at = ? WHERE id = ?", JSON.stringify([...aliases, alias]), nowIso(), studentId);
+}
+
 function applyVoiceMatch(taskId: string, currentTeacherId: string, text: string, source = "voice") {
   const task = getTaskForTeacher(taskId, currentTeacherId);
   const students: StudentLite[] = task.submissions.map((submission) => ({
@@ -416,18 +430,25 @@ function applyVoiceMatch(taskId: string, currentTeacherId: string, text: string,
     studentNo: submission.student.studentNo,
     aliases: submission.student.aliases
   }));
-  const match = matchStudentName(text, students);
-  if (match.matchedStudentId) {
+  const baseBatch = matchStudentNameSequence(text, students, {
+    submittedStudentIds: task.submissions
+      .filter((submission) => submission.status === "submitted")
+      .map((submission) => submission.student.id)
+  });
+  for (const segment of baseBatch.segments) {
+    if (segment.status !== "auto_submitted" || !segment.matchedStudentId) continue;
     run(
       "UPDATE homework_submissions SET status = 'submitted', source = ?, raw_text = ?, updated_at = ? WHERE task_id = ? AND student_id = ?",
       source,
-      text,
+      segment.rawText,
       nowIso(),
       taskId,
-      match.matchedStudentId
+      segment.matchedStudentId
     );
   }
-  return { match, task: getTaskForTeacher(taskId, currentTeacherId) };
+  const updatedTask = getTaskForTeacher(taskId, currentTeacherId);
+  const batch: VoiceBatchMatchResult = { ...baseBatch, stats: updatedTask.stats };
+  return { batch, task: updatedTask };
 }
 
 function sendAsr(ws: WebSocket, event: AsrServerEvent) {
@@ -960,7 +981,18 @@ app.patch("/api/homework-tasks/:id/submissions/:studentId", requireAuth, (req: A
     const task = getTaskForTeacher(routeParam(req, "id"), teacherId(req));
     const student = task.submissions.find((submission) => submission.student.id === routeParam(req, "studentId"));
     if (!student) throw new Error("学生不在该作业任务中");
-    run("UPDATE homework_submissions SET status = ?, source = ?, updated_at = ? WHERE task_id = ? AND student_id = ?", input.status, input.source, nowIso(), routeParam(req, "id"), routeParam(req, "studentId"));
+    run(
+      "UPDATE homework_submissions SET status = ?, source = ?, raw_text = COALESCE(?, raw_text), updated_at = ? WHERE task_id = ? AND student_id = ?",
+      input.status,
+      input.source,
+      input.rawText ?? null,
+      nowIso(),
+      routeParam(req, "id"),
+      routeParam(req, "studentId")
+    );
+    if (input.status === "submitted" && input.source === "voice-confirmed") {
+      learnVoiceAlias(routeParam(req, "studentId"), input.rawText);
+    }
     return ok(res, getSubmissions(routeParam(req, "id")).find((submission) => submission.student.id === routeParam(req, "studentId")));
   } catch (error) {
     return next(error);
@@ -1180,12 +1212,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     lastMatchedText = normalized;
     try {
       const result = applyVoiceMatch(asrContext.taskId, asrContext.teacherId, normalized, "asr");
-      const payload = {
-        text: normalized,
-        match: result.match,
-        stats: result.task.stats
-      };
-      sendAsr(ws, result.match.needsConfirmation ? { type: "pending", ...payload } : { type: "final", ...payload });
+      sendAsr(ws, { type: "batch-final", text: normalized, batch: result.batch, stats: result.task.stats });
     } catch (error) {
       sendAsr(ws, { type: "error", message: error instanceof Error ? error.message : "语音匹配失败" });
     }

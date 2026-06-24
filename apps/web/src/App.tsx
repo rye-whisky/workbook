@@ -20,7 +20,7 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AsrServerEvent, TaskStats, VoiceMatchResult } from "@workbook/shared";
+import type { AsrServerEvent, TaskStats, VoiceBatchMatchResult, VoiceSegmentMatch } from "@workbook/shared";
 import { DEFAULT_SUBJECTS } from "@workbook/shared";
 
 type Tab = "home" | "students" | "tasks" | "collect" | "settings";
@@ -99,7 +99,7 @@ interface ImportRow {
 
 interface PendingMatch {
   id: string;
-  match: VoiceMatchResult;
+  match: VoiceSegmentMatch;
 }
 
 interface ApiEnvelope<T> {
@@ -1001,6 +1001,7 @@ function CollectView(props: {
   const [asrStatus, setAsrStatus] = useState("未开始");
   const [partialText, setPartialText] = useState("");
   const [pending, setPending] = useState<PendingMatch[]>([]);
+  const [lastBatch, setLastBatch] = useState<VoiceBatchMatchResult | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const voiceStartingRef = useRef(false);
   const recognizedInSessionRef = useRef(false);
@@ -1019,19 +1020,33 @@ function CollectView(props: {
   const missing = task?.submissions.filter((item) => item.status === "missing") ?? [];
   const pendingSubmissions = task?.submissions.filter((item) => item.status === "pending_confirm") ?? [];
 
-  const sendVoiceText = useCallback(
-    async (text: string) => {
-      if (!props.selectedTaskId || !text.trim()) return;
-      const result = await api<{ match: VoiceMatchResult; task: HomeworkTask }>(
-        `/api/homework-tasks/${props.selectedTaskId}/voice-matches`,
-        { method: "POST", body: JSON.stringify({ text }) }
-      );
-      if (result.match.needsConfirmation) {
-        setPending((current) => [{ id: `${Date.now()}-${text}`, match: result.match }, ...current].slice(0, 8));
-      }
+  const applyBatchResult = useCallback(
+    async (batch: VoiceBatchMatchResult) => {
+      setLastBatch(batch);
+      setPending((current) => [
+        ...batch.pending.map((match) => ({ id: `${Date.now()}-${match.rawText}-${match.candidates[0]?.studentId ?? "none"}`, match })),
+        ...current
+      ].slice(0, 12));
+      const autoCount = batch.submittedStudentIds.length;
+      const pendingCount = batch.pending.length;
+      const unmatchedCount = batch.unmatched.length;
+      const duplicateCount = batch.duplicateStudentIds.length;
+      setAsrStatus(`识别完成：自动 ${autoCount} 人，待确认 ${pendingCount} 人，未匹配 ${unmatchedCount} 段，重复 ${duplicateCount} 人`);
       await props.onRefreshTask(props.selectedTaskId);
     },
     [props]
+  );
+
+  const sendVoiceText = useCallback(
+    async (text: string) => {
+      if (!props.selectedTaskId || !text.trim()) return;
+      const result = await api<{ batch: VoiceBatchMatchResult; task: HomeworkTask }>(
+        `/api/homework-tasks/${props.selectedTaskId}/voice-matches`,
+        { method: "POST", body: JSON.stringify({ text }) }
+      );
+      await applyBatchResult(result.batch);
+    },
+    [applyBatchResult, props.selectedTaskId]
   );
 
   const stopAudio = useCallback(() => {
@@ -1091,12 +1106,29 @@ function CollectView(props: {
         setAsrStatus("识别中");
         return;
       }
+      if (event.type === "batch-final") {
+        recognizedInSessionRef.current = true;
+        setPartialText("");
+        await applyBatchResult(event.batch);
+        return;
+      }
       if (event.type === "final" || event.type === "pending") {
         recognizedInSessionRef.current = true;
         setPartialText("");
         setAsrStatus(event.type === "final" ? `已识别：${event.text}` : `待确认：${event.text}`);
         if (event.match.needsConfirmation) {
-          setPending((current) => [{ id: `${Date.now()}-${event.text}`, match: event.match }, ...current].slice(0, 8));
+          const topCandidate = event.match.candidates[0];
+          const legacySegment: VoiceSegmentMatch = {
+            rawText: event.match.rawText,
+            normalizedText: event.match.normalizedText,
+            matchedStudentId: event.match.matchedStudentId,
+            matchedStudentName: topCandidate?.name ?? null,
+            confidence: event.match.confidence,
+            reason: event.match.reason,
+            status: event.match.candidates.length ? "pending_confirm" : "unmatched",
+            candidates: event.match.candidates
+          };
+          setPending((current) => [{ id: `${Date.now()}-${event.text}`, match: legacySegment }, ...current].slice(0, 8));
         }
         await props.onRefreshTask(props.selectedTaskId);
         return;
@@ -1115,7 +1147,7 @@ function CollectView(props: {
         );
       }
     },
-    [props]
+    [applyBatchResult, props]
   );
 
   async function startVoice() {
@@ -1216,12 +1248,12 @@ function CollectView(props: {
     closeVoiceSession(true);
   }
 
-  async function setSubmission(studentId: string, status: "submitted" | "missing" | "pending_confirm", source = "manual") {
+  async function setSubmission(studentId: string, status: "submitted" | "missing" | "pending_confirm", source = "manual", rawText?: string) {
     if (!props.selectedTaskId) return;
     await props.onAction(async () => {
       await api(`/api/homework-tasks/${props.selectedTaskId}/submissions/${studentId}`, {
         method: "PATCH",
-        body: JSON.stringify({ status, source })
+        body: JSON.stringify({ status, source, rawText })
       });
       await props.onRefreshTask(props.selectedTaskId);
     });
@@ -1285,6 +1317,32 @@ function CollectView(props: {
             {isSecureRecordingContext && !microphoneSupported ? <span>当前浏览器没有开放麦克风录音能力，请检查权限。</span> : null}
           </div>
 
+          {lastBatch ? (
+            <section className="section-block">
+              <div className="section-heading">
+                <h3>本次识别结果</h3>
+                <span className="count-badge green">{lastBatch.segments.length}</span>
+              </div>
+              <div className="result-summary">
+                <span>自动：{lastBatch.submittedStudentIds.length}</span>
+                <span>待确认：{lastBatch.pending.length}</span>
+                <span>未匹配：{lastBatch.unmatched.length}</span>
+                <span>重复：{lastBatch.duplicateStudentIds.length}</span>
+              </div>
+              <div className="recognized-list">
+                {lastBatch.segments.map((segment, index) => (
+                  <div className={cx("recognized-chip", segment.status)} key={`${segment.rawText}-${index}`}>
+                    <strong>{segment.matchedStudentName ?? segment.rawText}</strong>
+                    <span>
+                      {segment.rawText}
+                      {segment.reason !== "none" ? ` · ${segment.reason}` : ""}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
           {pending.length > 0 ? (
             <section className="section-block">
               <div className="section-heading">
@@ -1301,7 +1359,7 @@ function CollectView(props: {
                       <button
                         key={candidate.studentId}
                         onClick={() => {
-                          setSubmission(candidate.studentId, "submitted", "voice-confirmed").then(() =>
+                          setSubmission(candidate.studentId, "submitted", "voice-confirmed", item.match.rawText).then(() =>
                             setPending((current) => current.filter((pendingItem) => pendingItem.id !== item.id))
                           );
                         }}

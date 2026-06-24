@@ -45,7 +45,8 @@ export const homeworkTaskSchema = z.object({
 
 export const submissionStatusSchema = z.object({
   status: z.enum(["submitted", "missing", "pending_confirm"]),
-  source: z.string().trim().optional().default("manual")
+  source: z.string().trim().optional().default("manual"),
+  rawText: z.string().trim().optional()
 });
 
 export const voiceMatchSchema = z.object({

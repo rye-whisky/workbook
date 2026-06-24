@@ -385,6 +385,45 @@ select:focus {
   gap: 8px;
 }
 
+.result-summary,
+.recognized-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.result-summary span,
+.recognized-chip {
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--paper-strong);
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.recognized-chip {
+  min-width: 120px;
+  display: grid;
+  gap: 3px;
+}
+
+.recognized-chip span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recognized-chip.auto_submitted {
+  background: var(--green-soft);
+}
+
+.recognized-chip.pending_confirm {
+  background: var(--amber-soft);
+}
+
+.recognized-chip.unmatched {
+  background: var(--red-soft);
+}
+
 .task-row,
 .student-row,
 .submission-row,
