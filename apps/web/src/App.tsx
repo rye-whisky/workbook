@@ -454,7 +454,7 @@ function AuthScreen(props: {
                 />
               </label>
                             <label>
-                ??
+                学科
                 <input
                   value={registerForm.subjectName}
                   onChange={(event) => setRegisterForm({ ...registerForm, subjectName: event.target.value })}
