@@ -2,6 +2,7 @@
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync, gzipSync } from "node:zlib";
 import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import cors from "cors";
@@ -63,6 +64,23 @@ const secureCookies = process.env.COOKIE_SECURE
 const asrProvider = (process.env.ASR_PROVIDER ?? "disabled") as AsrProvider;
 const asrMockText = process.env.ASR_MOCK_TEXT ?? "张三";
 const defaultVolcengineAsrEndpoint = "wss://openspeech.bytedance.com/api/v2/asr";
+
+const volcengineProtocolVersion = 0x1;
+const volcengineHeaderSize = 0x1;
+const volcengineSerializationJson = 0x1;
+const volcengineCompressionGzip = 0x1;
+const volcengineMessageType = {
+  fullClientRequest: 0x1,
+  audioOnlyRequest: 0x2,
+  fullServerResponse: 0x9,
+  serverAck: 0xb,
+  serverError: 0xf
+} as const;
+const volcengineMessageFlags = {
+  noSequence: 0x0,
+  positiveSequence: 0x1,
+  negativeSequence: 0x2
+} as const;
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -352,6 +370,109 @@ function teacherIdFromUpgrade(req: http.IncomingMessage) {
 
 function volcengineAuthorizationHeader(token: string) {
   return `Bearer; ${token}`;
+}
+
+function buildVolcengineHeader(messageType: number, flags: number) {
+  return Buffer.from([
+    (volcengineProtocolVersion << 4) | volcengineHeaderSize,
+    (messageType << 4) | flags,
+    (volcengineSerializationJson << 4) | volcengineCompressionGzip,
+    0x00
+  ]);
+}
+
+function buildVolcengineFullClientRequest(payload: unknown) {
+  const body = gzipSync(Buffer.from(JSON.stringify(payload), "utf8"));
+  const size = Buffer.alloc(4);
+  size.writeUInt32BE(body.length, 0);
+  return Buffer.concat([
+    buildVolcengineHeader(volcengineMessageType.fullClientRequest, volcengineMessageFlags.noSequence),
+    size,
+    body
+  ]);
+}
+
+function buildVolcengineAudioRequest(audio: Buffer, sequence: number) {
+  const body = gzipSync(audio);
+  const sequenceBuffer = Buffer.alloc(4);
+  sequenceBuffer.writeInt32BE(sequence, 0);
+  const size = Buffer.alloc(4);
+  size.writeUInt32BE(body.length, 0);
+  return Buffer.concat([
+    buildVolcengineHeader(
+      volcengineMessageType.audioOnlyRequest,
+      sequence < 0 ? volcengineMessageFlags.negativeSequence : volcengineMessageFlags.positiveSequence
+    ),
+    sequenceBuffer,
+    size,
+    body
+  ]);
+}
+
+function rawDataToBuffer(message: RawData) {
+  if (Buffer.isBuffer(message)) return message;
+  if (message instanceof ArrayBuffer) return Buffer.from(message);
+  return Buffer.concat(message);
+}
+
+function parseVolcengineResponse(message: RawData) {
+  const buffer = rawDataToBuffer(message);
+  if (buffer.length < 8) {
+    return { type: "unknown", text: "", error: "火山 ASR 响应过短" };
+  }
+  const headerSize = (buffer[0] & 0x0f) * 4;
+  const messageType = buffer[1] >> 4;
+  const flags = buffer[1] & 0x0f;
+  const serialization = buffer[2] >> 4;
+  const compression = buffer[2] & 0x0f;
+  let offset = headerSize;
+  let sequence: number | undefined;
+  let code: number | undefined;
+
+  if (flags === volcengineMessageFlags.positiveSequence || flags === volcengineMessageFlags.negativeSequence) {
+    sequence = buffer.readInt32BE(offset);
+    offset += 4;
+  }
+
+  if (messageType === volcengineMessageType.serverError) {
+    code = buffer.readUInt32BE(offset);
+    offset += 4;
+  }
+
+  const payloadSize = buffer.readUInt32BE(offset);
+  offset += 4;
+  let payload = buffer.subarray(offset, offset + payloadSize);
+  if (compression === volcengineCompressionGzip && payload.length) {
+    payload = gunzipSync(payload);
+  }
+  const rawPayload = payload.toString("utf8");
+  let data: Record<string, unknown> | null = null;
+  if (serialization === volcengineSerializationJson && rawPayload) {
+    data = JSON.parse(rawPayload) as Record<string, unknown>;
+  }
+
+  const result = data?.result as Record<string, unknown> | undefined;
+  const text =
+    typeof data?.text === "string"
+      ? data.text
+      : typeof data?.result === "string"
+        ? data.result
+        : typeof result?.text === "string"
+          ? result.text
+          : "";
+  const isFinal =
+    flags === volcengineMessageFlags.negativeSequence ||
+    sequence !== undefined && sequence < 0 ||
+    data?.is_final === true ||
+    data?.final === true ||
+    data?.type === "final";
+
+  return {
+    type: messageType === volcengineMessageType.serverError ? "error" : isFinal ? "final" : "partial",
+    text,
+    error: rawPayload,
+    code
+  };
 }
 
 function ensureClass(currentTeacherId: string, gradeId: string, classId: string) {
@@ -737,6 +858,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
   let upstream: WebSocket | null = null;
   let started = false;
+  let audioSequence = 1;
 
   function closeUpstream() {
     if (upstream && upstream.readyState === WebSocket.OPEN) {
@@ -784,8 +906,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
     providerSocket.on("open", () => {
       providerSocket.send(
-        JSON.stringify({
-          type: "start",
+        buildVolcengineFullClientRequest({
           app: { appid: appId, token, cluster },
           user: { uid: asrContext.teacherId },
           request: {
@@ -808,25 +929,19 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     });
 
     providerSocket.on("message", (message) => {
-      const raw = message.toString();
       try {
-        const data = JSON.parse(raw) as Record<string, unknown>;
-        const text =
-          typeof data.text === "string"
-            ? data.text
-            : typeof data.result === "string"
-              ? data.result
-              : typeof (data.result as Record<string, unknown> | undefined)?.text === "string"
-                ? String((data.result as Record<string, unknown>).text)
-                : "";
-        const isFinal = data.is_final === true || data.final === true || data.type === "final";
-        if (text && isFinal) {
-          handleFinalText(text);
-        } else if (text) {
-          sendAsr(ws, { type: "partial", text });
+        const response = parseVolcengineResponse(message);
+        if (response.type === "error") {
+          sendAsr(ws, { type: "error", message: `火山引擎 ASR 错误${response.code ? ` ${response.code}` : ""}：${response.error}` });
+          return;
+        }
+        if (response.text && response.type === "final") {
+          handleFinalText(response.text);
+        } else if (response.text) {
+          sendAsr(ws, { type: "partial", text: response.text });
         }
       } catch {
-        sendAsr(ws, { type: "status", message: "收到火山 ASR 非 JSON 响应" });
+        sendAsr(ws, { type: "status", message: "火山 ASR 响应解析失败" });
       }
     });
 
@@ -850,7 +965,8 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   ws.on("message", (message: RawData, isBinary) => {
     if (isBinary) {
       if (asrProvider === "volcengine" && upstream?.readyState === WebSocket.OPEN) {
-        upstream.send(message);
+        upstream.send(buildVolcengineAudioRequest(rawDataToBuffer(message), audioSequence));
+        audioSequence += 1;
       }
       return;
     }
@@ -891,7 +1007,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       if (asrProvider === "mock") {
         handleFinalText(event.text || asrMockText);
       } else if (upstream?.readyState === WebSocket.OPEN) {
-        upstream.send(JSON.stringify({ type: "stop" }));
+        upstream.send(buildVolcengineAudioRequest(Buffer.alloc(0), -audioSequence));
       }
       sendAsr(ws, { type: "closed" });
       closeUpstream();
