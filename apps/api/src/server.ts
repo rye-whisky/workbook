@@ -1119,6 +1119,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   let audioChunksSent = 0;
   let audioBytesSent = 0;
   let stopFramePending = false;
+  let heldAudioChunk: Buffer | null = null;
   const pendingAudioChunks: Buffer[] = [];
   const maxPendingAudioBytes = 1024 * 1024 * 2;
 
@@ -1151,11 +1152,20 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       }
       return;
     }
-    upstream.send(buildVolcengineAudioRequest(chunk, last));
-    if (!last) {
+    if (last) {
+      const finalChunk = chunk.length > 0 ? chunk : heldAudioChunk ?? Buffer.alloc(0);
+      heldAudioChunk = null;
+      upstream.send(buildVolcengineAudioRequest(finalChunk, true));
       audioChunksSent += 1;
-      audioBytesSent += chunk.length;
+      audioBytesSent += finalChunk.length;
+      return;
     }
+    if (heldAudioChunk) {
+      upstream.send(buildVolcengineAudioRequest(heldAudioChunk, false));
+      audioChunksSent += 1;
+      audioBytesSent += heldAudioChunk.length;
+    }
+    heldAudioChunk = chunk;
   }
 
   function flushQueuedAudio() {

@@ -177,6 +177,16 @@ function floatToPcm16(input: Float32Array) {
   return buffer;
 }
 
+function concatFloat32(chunks: Float32Array[], length: number) {
+  const output = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+
 function formatDate(input: string) {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(input));
 }
@@ -1006,6 +1016,9 @@ function CollectView(props: {
   const voiceStartingRef = useRef(false);
   const recognizedInSessionRef = useRef(false);
   const audioFrameCountRef = useRef(0);
+  const sampleBuffersRef = useRef<Float32Array[]>([]);
+  const sampleBufferLengthRef = useRef(0);
+  const flushAudioRef = useRef<(() => void) | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1058,12 +1071,18 @@ function CollectView(props: {
     workletNodeRef.current = null;
     streamRef.current = null;
     audioContextRef.current = null;
+    sampleBuffersRef.current = [];
+    sampleBufferLengthRef.current = 0;
+    flushAudioRef.current = null;
   }, []);
 
   const closeVoiceSession = useCallback(
     (sendStop = true) => {
       const ws = wsRef.current;
       voiceStartingRef.current = false;
+      if (sendStop) {
+        flushAudioRef.current?.();
+      }
       if (sendStop && ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "stop" }));
       }
@@ -1184,7 +1203,7 @@ function CollectView(props: {
       audioContextRef.current = audioContext;
       wsRef.current = ws;
 
-      const sendSamples = (samples: Float32Array) => {
+      const sendPcmChunk = (samples: Float32Array) => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const pcm = floatToPcm16(downsampleTo16k(samples, audioContext.sampleRate));
         audioFrameCountRef.current += 1;
@@ -1192,6 +1211,21 @@ function CollectView(props: {
           setAsrStatus(`录音中，已采集 ${audioFrameCountRef.current} 段音频`);
         }
         ws.send(pcm);
+      };
+      const flushSamples = () => {
+        if (!sampleBufferLengthRef.current) return;
+        const samples = concatFloat32(sampleBuffersRef.current, sampleBufferLengthRef.current);
+        sampleBuffersRef.current = [];
+        sampleBufferLengthRef.current = 0;
+        sendPcmChunk(samples);
+      };
+      flushAudioRef.current = flushSamples;
+      const sendSamples = (samples: Float32Array) => {
+        sampleBuffersRef.current.push(new Float32Array(samples));
+        sampleBufferLengthRef.current += samples.length;
+        if (sampleBufferLengthRef.current >= audioContext.sampleRate * 0.2) {
+          flushSamples();
+        }
       };
 
       ws.binaryType = "arraybuffer";
