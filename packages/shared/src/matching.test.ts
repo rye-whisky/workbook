@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { matchStudentName, matchStudentNameSequence, shouldLearnVoiceAlias } from "./matching";
+import { submissionStatusSchema } from "./schemas";
 import type { StudentLite } from "./types";
 
 const students: StudentLite[] = [
@@ -78,5 +79,13 @@ describe("matchStudentNameSequence", () => {
   it("learns only short Chinese ASR aliases", () => {
     expect(shouldLearnVoiceAlias("捡乐家")).toBe("捡乐家");
     expect(shouldLearnVoiceAlias("捡乐家言子轩")).toBeNull();
+  });
+});
+
+describe("submissionStatusSchema", () => {
+  it("accepts register statuses used by homework collection", () => {
+    for (const status of ["submitted", "missing", "pending_confirm", "late_submitted", "leave"]) {
+      expect(submissionStatusSchema.parse({ status }).status).toBe(status);
+    }
   });
 });

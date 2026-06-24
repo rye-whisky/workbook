@@ -1,4 +1,4 @@
-export type StudentStatus = "submitted" | "missing" | "pending_confirm";
+export type StudentStatus = "submitted" | "missing" | "pending_confirm" | "late_submitted" | "leave";
 
 export type HomeworkTaskStatus = "draft" | "active" | "closed";
 
@@ -58,7 +58,31 @@ export interface TaskStats {
   submitted: number;
   missing: number;
   pending: number;
+  lateSubmitted: number;
+  leave: number;
   total: number;
+}
+
+export interface HomeworkRegisterCell {
+  taskId: string;
+  studentId: string;
+  status: StudentStatus;
+  symbol: "√" | "×" | "O" | "?";
+  color: "normal" | "red" | "warning";
+}
+
+export interface HomeworkRegister {
+  grade: { id: string; name: string };
+  classroom: { id: string; name: string };
+  students: Array<{ id: string; name: string; displayOrder: number }>;
+  tasks: Array<{
+    id: string;
+    title: string;
+    dueDate: string;
+    subjectName: string;
+    teacherName: string;
+  }>;
+  cells: HomeworkRegisterCell[];
 }
 
 export type AsrProvider = "disabled" | "browser" | "volcengine" | "mock";

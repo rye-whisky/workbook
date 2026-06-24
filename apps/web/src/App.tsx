@@ -20,7 +20,7 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AsrServerEvent, TaskStats, VoiceBatchMatchResult, VoiceSegmentMatch } from "@workbook/shared";
+import type { AsrServerEvent, HomeworkRegister, StudentStatus, TaskStats, VoiceBatchMatchResult, VoiceSegmentMatch } from "@workbook/shared";
 import { DEFAULT_SUBJECTS } from "@workbook/shared";
 
 type Tab = "home" | "students" | "tasks" | "collect" | "settings";
@@ -62,7 +62,7 @@ interface Student {
 
 interface Submission {
   id: string;
-  status: "submitted" | "missing" | "pending_confirm";
+  status: StudentStatus;
   source: string;
   rawText?: string | null;
   student: Student;
@@ -198,6 +198,14 @@ function toInputDate(input?: string) {
 
 function taskTitle(task: HomeworkTask) {
   return `${task.grade.name}${task.classroom.name} · ${task.subject.name}`;
+}
+
+function statusLabel(status: StudentStatus) {
+  if (status === "submitted") return "\u5df2\u4ea4";
+  if (status === "late_submitted") return "\u8865\u4ea4";
+  if (status === "leave") return "\u8bf7\u5047";
+  if (status === "pending_confirm") return "\u5f85\u786e\u8ba4";
+  return "\u672a\u4ea4";
 }
 
 export default function App() {
@@ -576,15 +584,57 @@ function StudentsView(props: {
   const [gradeName, setGradeName] = useState("");
   const [className, setClassName] = useState("");
   const [classGradeId, setClassGradeId] = useState(props.data.grades[0]?.id ?? "");
+  const [register, setRegister] = useState<HomeworkRegister | null>(null);
+  const [registerLoading, setRegisterLoading] = useState(false);
   const selectedClass = props.data.classrooms.find((classroom) => classroom.id === props.selectedClassId);
   const classStudents = props.data.students.filter((student) => student.classId === props.selectedClassId);
   const students = classStudents.filter((student) => !query || student.name.includes(query));
+  const registerCellMap = useMemo(
+    () => new Map((register?.cells ?? []).map((cell) => [`${cell.taskId}:${cell.studentId}`, cell])),
+    [register]
+  );
 
   useEffect(() => {
     if (!classGradeId && props.data.grades[0]?.id) {
       setClassGradeId(props.data.grades[0].id);
     }
   }, [classGradeId, props.data.grades]);
+
+  const loadRegister = useCallback(async () => {
+    if (!props.selectedClassId) {
+      setRegister(null);
+      return;
+    }
+    setRegisterLoading(true);
+    try {
+      setRegister(await api<HomeworkRegister>(`/api/classes/${props.selectedClassId}/homework-register`));
+    } finally {
+      setRegisterLoading(false);
+    }
+  }, [props.selectedClassId]);
+
+  useEffect(() => {
+    loadRegister().catch(() => setRegister(null));
+  }, [loadRegister, props.data.tasks, props.data.students]);
+
+  async function exportRegister() {
+    if (!props.selectedClassId || !selectedClass) return;
+    const response = await fetch(`/api/classes/${props.selectedClassId}/homework-register/export`, {
+      credentials: "include"
+    });
+    if (!response.ok) {
+      throw new Error("导出失败");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${selectedClass.grade?.name ?? ""}${selectedClass.name}作业登记表.xlsx`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
 
   async function createStudent(event: FormEvent) {
     event.preventDefault();
@@ -769,6 +819,62 @@ function StudentsView(props: {
         </div>
       </section>
       <ClassSelect classes={props.data.classrooms} value={props.selectedClassId} onChange={props.onClassChange} />
+
+      <section className="section-block register-section">
+        <div className="section-heading">
+          <div>
+            <h3>{selectedClass ? (selectedClass.grade?.name ?? "") + selectedClass.name + "\u4f5c\u4e1a\u767b\u8bb0\u8868" : "\u4f5c\u4e1a\u767b\u8bb0\u8868"}</h3>
+            <span className="section-subtitle">{"\u6309\u82b1\u540d\u518c\u987a\u5e8f\u5c55\u793a\uff0c\u72b6\u6001\u968f\u6536\u4f5c\u4e1a\u540c\u6b65\u66f4\u65b0"}</span>
+          </div>
+          <button
+            className="icon-text-button"
+            disabled={props.busy || registerLoading || !register}
+            onClick={() => props.onAction(exportRegister, "Excel exported")}
+          >
+            <FileSpreadsheet size={17} />
+            {"\u5bfc\u51faExcel"}
+          </button>
+        </div>
+        {!register || registerLoading ? <Empty label={registerLoading ? "\u6b63\u5728\u52a0\u8f7d\u767b\u8bb0\u8868" : "\u5f53\u524d\u73ed\u7ea7\u6682\u65e0\u767b\u8bb0\u8868"} /> : null}
+        {register ? (
+          <div className="register-scroll">
+            <table className="register-table">
+              <thead>
+                <tr>
+                  <th className="sticky-name" rowSpan={2}>{"\u59d3\u540d"}</th>
+                  {register.tasks.length === 0 ? <th>{"\u6682\u65e0\u4f5c\u4e1a"}</th> : null}
+                  {register.tasks.map((task) => (
+                    <th key={"date-" + task.id}>{formatDate(task.dueDate)}</th>
+                  ))}
+                </tr>
+                <tr>
+                  {register.tasks.length === 0 ? <th>{"\u521b\u5efa\u4f5c\u4e1a\u540e\u81ea\u52a8\u751f\u6210\u5217"}</th> : null}
+                  {register.tasks.map((task) => (
+                    <th key={"title-" + task.id}>{task.title}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {register.students.map((student) => (
+                  <tr key={student.id}>
+                    <th className="sticky-name">{student.name}</th>
+                    {register.tasks.length === 0 ? <td className="register-empty-cell">-</td> : null}
+                    {register.tasks.map((task) => {
+                      const cell = registerCellMap.get(task.id + ":" + student.id);
+                      return (
+                        <td className={cx("register-status", cell?.color === "red" && "late", cell?.color === "warning" && "warning")} key={task.id + "-" + student.id}>
+                          {cell?.symbol ?? "\u00d7"}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </section>
+
       <form className="compact-form" onSubmit={createStudent}>
         <input placeholder="姓名" value={studentName} onChange={(event) => setStudentName(event.target.value)} />
         <button className="icon-text-button" disabled={props.busy || !selectedClass}>
@@ -1006,7 +1112,6 @@ function CollectView(props: {
   onAction: (action: () => Promise<void>, success?: string) => Promise<void>;
   onRefreshTask: (id?: string) => Promise<void>;
 }) {
-  const [manualName, setManualName] = useState("");
   const [listening, setListening] = useState(false);
   const [asrStatus, setAsrStatus] = useState("未开始");
   const [partialText, setPartialText] = useState("");
@@ -1031,6 +1136,8 @@ function CollectView(props: {
 
   const submitted = task?.submissions.filter((item) => item.status === "submitted") ?? [];
   const missing = task?.submissions.filter((item) => item.status === "missing") ?? [];
+  const lateSubmitted = task?.submissions.filter((item) => item.status === "late_submitted") ?? [];
+  const leaveSubmissions = task?.submissions.filter((item) => item.status === "leave") ?? [];
   const pendingSubmissions = task?.submissions.filter((item) => item.status === "pending_confirm") ?? [];
 
   const applyBatchResult = useCallback(
@@ -1048,18 +1155,6 @@ function CollectView(props: {
       await props.onRefreshTask(props.selectedTaskId);
     },
     [props]
-  );
-
-  const sendVoiceText = useCallback(
-    async (text: string) => {
-      if (!props.selectedTaskId || !text.trim()) return;
-      const result = await api<{ batch: VoiceBatchMatchResult; task: HomeworkTask }>(
-        `/api/homework-tasks/${props.selectedTaskId}/voice-matches`,
-        { method: "POST", body: JSON.stringify({ text }) }
-      );
-      await applyBatchResult(result.batch);
-    },
-    [applyBatchResult, props.selectedTaskId]
   );
 
   const stopAudio = useCallback(() => {
@@ -1282,7 +1377,7 @@ function CollectView(props: {
     closeVoiceSession(true);
   }
 
-  async function setSubmission(studentId: string, status: "submitted" | "missing" | "pending_confirm", source = "manual", rawText?: string) {
+  async function setSubmission(studentId: string, status: StudentStatus, source = "manual", rawText?: string) {
     if (!props.selectedTaskId) return;
     await props.onAction(async () => {
       await api(`/api/homework-tasks/${props.selectedTaskId}/submissions/${studentId}`, {
@@ -1317,9 +1412,11 @@ function CollectView(props: {
           </div>
 
           <div className="stats-grid">
-            <Stat label="已交" value={task.stats.submitted} tone="green" />
-            <Stat label="未交" value={task.stats.missing} tone="red" />
-            <Stat label="待确认" value={task.stats.pending + pending.length} tone="amber" />
+            <Stat label={"\u5df2\u4ea4"} value={task.stats.submitted} tone="green" />
+            <Stat label={"\u672a\u4ea4"} value={task.stats.missing} tone="red" />
+            <Stat label={"\u8865\u4ea4"} value={task.stats.lateSubmitted} tone="amber" />
+            <Stat label={"\u8bf7\u5047"} value={task.stats.leave} tone="ink" />
+            <Stat label={"\u5f85\u786e\u8ba4"} value={task.stats.pending + pending.length} tone="amber" />
           </div>
 
           <div className="voice-dock">
@@ -1327,21 +1424,10 @@ function CollectView(props: {
               {listening ? <Pause size={28} /> : <Mic size={28} />}
               <span>{listening ? "结束录音" : "开始录音"}</span>
             </button>
-            <form
-              className="manual-name"
-              onSubmit={(event) => {
-                event.preventDefault();
-                props.onAction(async () => {
-                  await sendVoiceText(manualName);
-                  setManualName("");
-                });
-              }}
-            >
-              <input placeholder="手动输入姓名" value={manualName} onChange={(event) => setManualName(event.target.value)} />
-              <button className="icon-button" title="提交姓名" disabled={props.busy}>
-                <Check size={18} />
-              </button>
-            </form>
+            <div className="voice-hint">
+              <strong>{"\u8bed\u97f3\u8fde\u7eed\u70b9\u540d"}</strong>
+              <span>{"\u70b9\u5f00\u59cb\u5f55\u97f3\u540e\u8fde\u7eed\u5ff5\u5df2\u4ea4\u5b66\u751f\u59d3\u540d\uff0c\u7ed3\u675f\u540e\u81ea\u52a8\u5339\u914d\u82b1\u540d\u518c\u3002"}</span>
+            </div>
           </div>
 
           <div className="asr-status">
@@ -1410,9 +1496,11 @@ function CollectView(props: {
             </section>
           ) : null}
 
-          <SubmissionGroup title="未交" submissions={missing} tone="red" onSet={setSubmission} />
-          <SubmissionGroup title="已交" submissions={submitted} tone="green" onSet={setSubmission} />
-          <SubmissionGroup title="状态待确认" submissions={pendingSubmissions} tone="amber" onSet={setSubmission} />
+          <SubmissionGroup title={"\u672a\u4ea4"} submissions={missing} tone="red" onSet={setSubmission} />
+          <SubmissionGroup title={"\u5df2\u4ea4"} submissions={submitted} tone="green" onSet={setSubmission} />
+          <SubmissionGroup title={"\u8865\u4ea4"} submissions={lateSubmitted} tone="amber" onSet={setSubmission} />
+          <SubmissionGroup title={"\u8bf7\u5047"} submissions={leaveSubmissions} tone="ink" onSet={setSubmission} />
+          <SubmissionGroup title={"\u72b6\u6001\u5f85\u786e\u8ba4"} submissions={pendingSubmissions} tone="amber" onSet={setSubmission} />
         </>
       ) : null}
     </section>
@@ -1421,9 +1509,9 @@ function CollectView(props: {
 
 function SubmissionGroup(props: {
   title: string;
-  tone: "green" | "red" | "amber";
+  tone: "green" | "red" | "amber" | "ink";
   submissions: Submission[];
-  onSet: (studentId: string, status: "submitted" | "missing" | "pending_confirm") => Promise<void>;
+  onSet: (studentId: string, status: StudentStatus) => Promise<void>;
 }) {
   return (
     <section className="section-block">
@@ -1436,14 +1524,20 @@ function SubmissionGroup(props: {
         <div className="submission-row" key={submission.id}>
           <div>
             <strong>{submission.student.name}</strong>
-            <span>{submission.student.studentNo ? `学号 ${submission.student.studentNo}` : submission.source}</span>
+            <span>{statusLabel(submission.status)} {"\u00b7"} {submission.source}</span>
           </div>
-          <div className="row-actions">
-            <button className="icon-button small good" title="标记已交" onClick={() => props.onSet(submission.student.id, "submitted")}>
+          <div className="row-actions status-actions">
+            <button className="icon-button small good" title={"\u6807\u8bb0\u5df2\u4ea4"} disabled={submission.status === "submitted"} onClick={() => props.onSet(submission.student.id, "submitted")}>
               <Check size={15} />
             </button>
-            <button className="icon-button small danger" title="标记未交" onClick={() => props.onSet(submission.student.id, "missing")}>
-              <X size={15} />
+            <button className="status-action late" title={"\u6807\u8bb0\u8865\u4ea4"} disabled={submission.status === "late_submitted"} onClick={() => props.onSet(submission.student.id, "late_submitted")}>
+              {"\u8865"}
+            </button>
+            <button className="status-action leave" title={"\u6807\u8bb0\u8bf7\u5047"} disabled={submission.status === "leave"} onClick={() => props.onSet(submission.student.id, "leave")}>
+              {"\u5047"}
+            </button>
+            <button className="status-action missing" title={"\u6539\u56de\u672a\u4ea4"} disabled={submission.status === "missing"} onClick={() => props.onSet(submission.student.id, "missing")}>
+              {"\u00d7"}
             </button>
           </div>
         </div>

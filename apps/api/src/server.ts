@@ -9,6 +9,7 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
+import ExcelJS from "exceljs";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import rateLimit from "express-rate-limit";
@@ -33,6 +34,8 @@ import {
   type ApiEnvelope,
   type AsrProvider,
   type AsrServerEvent,
+  type HomeworkRegister,
+  type HomeworkRegisterCell,
   type StudentLite,
   type TaskStats,
   type VoiceBatchMatchResult
@@ -248,16 +251,30 @@ function parseDate(input: string) {
 function taskStats(submissions: Array<{ status: string }>): TaskStats {
   let submitted = 0;
   let pending = 0;
+  let lateSubmitted = 0;
+  let leave = 0;
   for (const submission of submissions) {
     if (submission.status === "submitted") submitted += 1;
     if (submission.status === "pending_confirm") pending += 1;
+    if (submission.status === "late_submitted") lateSubmitted += 1;
+    if (submission.status === "leave") leave += 1;
   }
   return {
     submitted,
     pending,
-    missing: submissions.length - submitted - pending,
+    lateSubmitted,
+    leave,
+    missing: submissions.length - submitted - pending - lateSubmitted - leave,
     total: submissions.length
   };
+}
+
+function submissionCell(status: string): Pick<HomeworkRegisterCell, "symbol" | "color"> {
+  if (status === "submitted") return { symbol: "√", color: "normal" };
+  if (status === "late_submitted") return { symbol: "√", color: "red" };
+  if (status === "leave") return { symbol: "O", color: "normal" };
+  if (status === "pending_confirm") return { symbol: "?", color: "warning" };
+  return { symbol: "×", color: "normal" };
 }
 
 function camelTeacher(row: Row) {
@@ -410,6 +427,144 @@ function getTaskForTeacher(taskId: string, currentTeacherId: string) {
   return camelTask(row);
 }
 
+function getRegisterTaskRows(classId: string, currentTeacherId: string) {
+  return all(
+    `SELECT t.*, s.name AS subject_name, g.name AS grade_name, c.name AS class_name, te.name AS teacher_name
+     FROM homework_tasks t
+     JOIN subjects s ON s.id = t.subject_id
+     JOIN grades g ON g.id = t.grade_id
+     JOIN classrooms c ON c.id = t.class_id
+     JOIN teachers te ON te.id = t.teacher_id
+     WHERE t.class_id = ? AND t.teacher_id = ?
+     ORDER BY t.due_date ASC, t.created_at ASC`,
+    classId,
+    currentTeacherId
+  );
+}
+
+function getHomeworkRegister(classId: string, currentTeacherId: string): HomeworkRegister {
+  const classroom = one(
+    `SELECT c.id, c.name, c.grade_id, g.name AS grade_name
+     FROM classrooms c
+     JOIN grades g ON g.id = c.grade_id
+     WHERE c.id = ? AND c.deleted_at IS NULL AND g.deleted_at IS NULL`,
+    classId
+  );
+  if (!classroom) {
+    throw notFound("班级不存在或已删除");
+  }
+  const students = getStudents(classId).map((student) => ({
+    id: student.id,
+    name: student.name,
+    displayOrder: student.displayOrder
+  }));
+  const taskRows = getRegisterTaskRows(classId, currentTeacherId);
+  const tasks = taskRows.map((row) => ({
+    id: String(row.id),
+    title: String(row.title),
+    dueDate: String(row.due_date),
+    subjectName: row.subject_name_snapshot ? String(row.subject_name_snapshot) : String(row.subject_name),
+    teacherName: String(row.teacher_name)
+  }));
+  const cells: HomeworkRegisterCell[] = [];
+  for (const task of tasks) {
+    const submissions = new Map(
+      all("SELECT student_id, status FROM homework_submissions WHERE task_id = ?", task.id).map((row) => [
+        String(row.student_id),
+        String(row.status)
+      ])
+    );
+    for (const student of students) {
+      const status = submissions.get(student.id) ?? "missing";
+      const cell = submissionCell(status);
+      cells.push({
+        taskId: task.id,
+        studentId: student.id,
+        status: status as HomeworkRegisterCell["status"],
+        symbol: cell.symbol,
+        color: cell.color
+      });
+    }
+  }
+  return {
+    grade: { id: String(classroom.grade_id), name: String(classroom.grade_name) },
+    classroom: { id: String(classroom.id), name: String(classroom.name) },
+    students,
+    tasks,
+    cells
+  };
+}
+
+function shortDate(input: string) {
+  const date = new Date(input);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${month}/${day}`;
+}
+
+function safeSheetName(input: string) {
+  return input.replace(/[\\/*?:[\]]/g, "").slice(0, 31) || "作业登记表";
+}
+
+function contentDispositionFilename(filename: string) {
+  return `attachment; filename="homework-register.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+async function buildHomeworkRegisterWorkbook(register: HomeworkRegister) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Workbook";
+  workbook.created = new Date();
+  const sheetName = safeSheetName(`${register.grade.name}${register.classroom.name}`);
+  const worksheet = workbook.addWorksheet(sheetName);
+  const totalColumns = Math.max(2, register.tasks.length + 1);
+  worksheet.mergeCells(1, 1, 1, totalColumns);
+  worksheet.getCell(1, 1).value = `${register.grade.name}${register.classroom.name}作业登记表`;
+  worksheet.getCell(1, 1).alignment = { horizontal: "center", vertical: "middle" };
+  worksheet.getCell(1, 1).font = { name: "宋体", size: 16, bold: true };
+  worksheet.getCell(2, 1).value = "姓名";
+  worksheet.getCell(3, 1).value = "";
+  register.tasks.forEach((task, index) => {
+    const column = index + 2;
+    worksheet.getCell(2, column).value = shortDate(task.dueDate);
+    worksheet.getCell(3, column).value = task.title;
+  });
+  const cellByKey = new Map(register.cells.map((cell) => [`${cell.taskId}:${cell.studentId}`, cell]));
+  register.students.forEach((student, studentIndex) => {
+    const rowNumber = studentIndex + 4;
+    worksheet.getCell(rowNumber, 1).value = student.name;
+    register.tasks.forEach((task, taskIndex) => {
+      const column = taskIndex + 2;
+      const registerCell = cellByKey.get(`${task.id}:${student.id}`);
+      const worksheetCell = worksheet.getCell(rowNumber, column);
+      worksheetCell.value = registerCell?.symbol ?? "×";
+      if (registerCell?.color === "red") {
+        worksheetCell.font = { name: "宋体", color: { argb: "FFFF0000" }, bold: true };
+      }
+    });
+  });
+  worksheet.columns = [
+    { width: 12 },
+    ...register.tasks.map(() => ({ width: 12 }))
+  ];
+  worksheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3 }];
+  for (let row = 1; row <= register.students.length + 3; row += 1) {
+    for (let column = 1; column <= totalColumns; column += 1) {
+      const cell = worksheet.getCell(row, column);
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" }
+      };
+      if (row === 2 || row === 3) {
+        cell.font = { name: "宋体", bold: true };
+      }
+    }
+  }
+  return workbook;
+}
+
 function learnVoiceAlias(studentId: string, rawText: string | undefined) {
   if (!rawText) return;
   const alias = shouldLearnVoiceAlias(rawText);
@@ -432,7 +587,7 @@ function applyVoiceMatch(taskId: string, currentTeacherId: string, text: string,
   }));
   const baseBatch = matchStudentNameSequence(text, students, {
     submittedStudentIds: task.submissions
-      .filter((submission) => submission.status === "submitted")
+      .filter((submission) => submission.status === "submitted" || submission.status === "late_submitted")
       .map((submission) => submission.student.id)
   });
   for (const segment of baseBatch.segments) {
@@ -903,6 +1058,28 @@ app.patch("/api/classes/:id/students/order", requireAuth, (req: AuthRequest, res
       });
     });
     return ok(res, getStudents(classId));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/classes/:id/homework-register", requireAuth, (req: AuthRequest, res, next) => {
+  try {
+    return ok(res, getHomeworkRegister(routeParam(req, "id"), teacherId(req)));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/classes/:id/homework-register/export", requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const register = getHomeworkRegister(routeParam(req, "id"), teacherId(req));
+    const workbook = await buildHomeworkRegisterWorkbook(register);
+    const buffer = await workbook.xlsx.writeBuffer();
+    const filename = `${register.grade.name}${register.classroom.name}作业登记表.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", contentDispositionFilename(filename));
+    return res.send(Buffer.from(buffer));
   } catch (error) {
     return next(error);
   }

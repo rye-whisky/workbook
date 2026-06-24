@@ -44,7 +44,7 @@ export const homeworkTaskSchema = z.object({
 });
 
 export const submissionStatusSchema = z.object({
-  status: z.enum(["submitted", "missing", "pending_confirm"]),
+  status: z.enum(["submitted", "missing", "pending_confirm", "late_submitted", "leave"]),
   source: z.string().trim().optional().default("manual"),
   rawText: z.string().trim().optional()
 });
