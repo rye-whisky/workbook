@@ -1,11 +1,11 @@
-﻿import "dotenv/config";
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import cors from "cors";
+import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
 import jwt from "jsonwebtoken";
 import multer from "multer";
@@ -50,11 +50,13 @@ interface AsrUpgradeRequest extends http.IncomingMessage {
 const app = express();
 const server = http.createServer(app);
 const asrWss = new WebSocketServer({ noServer: true });
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
+dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: false });
 const port = Number(process.env.PORT ?? 4100);
 const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 const sessionSecret = process.env.SESSION_SECRET ?? "dev-only-change-me";
 const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "uploads");
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const secureCookies = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === "true"
   : webOrigin.startsWith("https://");
