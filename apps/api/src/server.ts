@@ -392,18 +392,15 @@ function buildVolcengineFullClientRequest(payload: unknown) {
   ]);
 }
 
-function buildVolcengineAudioRequest(audio: Buffer, sequence: number) {
+function buildVolcengineAudioRequest(audio: Buffer, last: boolean) {
   const body = gzipSync(audio);
-  const sequenceBuffer = Buffer.alloc(4);
-  sequenceBuffer.writeInt32BE(sequence, 0);
   const size = Buffer.alloc(4);
   size.writeUInt32BE(body.length, 0);
   return Buffer.concat([
     buildVolcengineHeader(
       volcengineMessageType.audioOnlyRequest,
-      sequence < 0 ? volcengineMessageFlags.negativeSequence : volcengineMessageFlags.positiveSequence
+      last ? volcengineMessageFlags.negativeSequence : volcengineMessageFlags.noSequence
     ),
-    sequenceBuffer,
     size,
     body
   ]);
@@ -425,27 +422,34 @@ function parseVolcengineResponse(message: RawData) {
   const flags = buffer[1] & 0x0f;
   const serialization = buffer[2] >> 4;
   const compression = buffer[2] & 0x0f;
-  let offset = headerSize;
+  const payload = buffer.subarray(headerSize);
+  let payloadMessage: Buffer | null = null;
   let sequence: number | undefined;
   let code: number | undefined;
 
-  if (flags === volcengineMessageFlags.positiveSequence || flags === volcengineMessageFlags.negativeSequence) {
-    sequence = buffer.readInt32BE(offset);
-    offset += 4;
+  if (messageType === volcengineMessageType.fullServerResponse) {
+    const payloadSize = payload.readInt32BE(0);
+    payloadMessage = payload.subarray(4, 4 + payloadSize);
+  } else if (messageType === volcengineMessageType.serverAck) {
+    sequence = payload.readInt32BE(0);
+    if (payload.length >= 8) {
+      const payloadSize = payload.readUInt32BE(4);
+      payloadMessage = payload.subarray(8, 8 + payloadSize);
+    }
+  } else if (messageType === volcengineMessageType.serverError) {
+    code = payload.readUInt32BE(0);
+    const payloadSize = payload.readUInt32BE(4);
+    payloadMessage = payload.subarray(8, 8 + payloadSize);
   }
 
-  if (messageType === volcengineMessageType.serverError) {
-    code = buffer.readUInt32BE(offset);
-    offset += 4;
+  if (!payloadMessage) {
+    return { type: "ack", text: "", error: "", code };
   }
 
-  const payloadSize = buffer.readUInt32BE(offset);
-  offset += 4;
-  let payload = buffer.subarray(offset, offset + payloadSize);
-  if (compression === volcengineCompressionGzip && payload.length) {
-    payload = gunzipSync(payload);
+  if (compression === volcengineCompressionGzip && payloadMessage.length) {
+    payloadMessage = gunzipSync(payloadMessage);
   }
-  const rawPayload = payload.toString("utf8");
+  const rawPayload = payloadMessage.toString("utf8");
   let data: Record<string, unknown> | null = null;
   if (serialization === volcengineSerializationJson && rawPayload) {
     data = JSON.parse(rawPayload) as Record<string, unknown>;
@@ -858,7 +862,6 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
 
   let upstream: WebSocket | null = null;
   let started = false;
-  let audioSequence = 1;
 
   function closeUpstream() {
     if (upstream && upstream.readyState === WebSocket.OPEN) {
@@ -965,8 +968,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   ws.on("message", (message: RawData, isBinary) => {
     if (isBinary) {
       if (asrProvider === "volcengine" && upstream?.readyState === WebSocket.OPEN) {
-        upstream.send(buildVolcengineAudioRequest(rawDataToBuffer(message), audioSequence));
-        audioSequence += 1;
+        upstream.send(buildVolcengineAudioRequest(rawDataToBuffer(message), false));
       }
       return;
     }
@@ -1007,7 +1009,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       if (asrProvider === "mock") {
         handleFinalText(event.text || asrMockText);
       } else if (upstream?.readyState === WebSocket.OPEN) {
-        upstream.send(buildVolcengineAudioRequest(Buffer.alloc(0), -audioSequence));
+        upstream.send(buildVolcengineAudioRequest(Buffer.alloc(0), true));
       }
       sendAsr(ws, { type: "closed" });
       closeUpstream();
