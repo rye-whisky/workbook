@@ -1002,6 +1002,7 @@ function CollectView(props: {
   const [partialText, setPartialText] = useState("");
   const [pending, setPending] = useState<PendingMatch[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
+  const voiceStartingRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1042,6 +1043,27 @@ function CollectView(props: {
     audioContextRef.current = null;
   }, []);
 
+  const closeVoiceSession = useCallback(
+    (sendStop = true) => {
+      const ws = wsRef.current;
+      wsRef.current = null;
+      voiceStartingRef.current = false;
+      if (sendStop && ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "stop" }));
+      }
+      if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+        window.setTimeout(() => ws.close(), sendStop ? 600 : 0);
+      }
+      stopAudio();
+      setListening(false);
+    },
+    [stopAudio]
+  );
+
+  useEffect(() => {
+    return () => closeVoiceSession(false);
+  }, [closeVoiceSession]);
+
   const handleAsrEvent = useCallback(
     async (event: AsrServerEvent) => {
       if (event.type === "ready") {
@@ -1078,6 +1100,11 @@ function CollectView(props: {
   );
 
   async function startVoice() {
+    const currentSocket = wsRef.current;
+    if (listening || voiceStartingRef.current || currentSocket?.readyState === WebSocket.CONNECTING || currentSocket?.readyState === WebSocket.OPEN) {
+      setAsrStatus("录音连接正在进行中，请先结束当前录音");
+      return;
+    }
     if (!props.selectedTaskId) {
       setAsrStatus("请先选择作业任务");
       return;
@@ -1091,6 +1118,7 @@ function CollectView(props: {
       return;
     }
     try {
+      voiceStartingRef.current = true;
       setAsrStatus("请求麦克风权限");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -1110,22 +1138,28 @@ function CollectView(props: {
 
       ws.binaryType = "arraybuffer";
       ws.onopen = async () => {
-        ws.send(JSON.stringify({ type: "start" }));
-        setAsrStatus("录音中");
-        setListening(true);
-        if (audioContext.audioWorklet) {
-          await audioContext.audioWorklet.addModule("/audio-recorder-worklet.js");
-          const node = new AudioWorkletNode(audioContext, "workbook-audio-recorder");
-          node.port.onmessage = (event: MessageEvent<Float32Array>) => sendSamples(event.data);
-          source.connect(node);
-          node.connect(audioContext.destination);
-          workletNodeRef.current = node;
-        } else {
-          const processor = audioContext.createScriptProcessor(4096, 1, 1);
-          processor.onaudioprocess = (event) => sendSamples(event.inputBuffer.getChannelData(0));
-          source.connect(processor);
-          processor.connect(audioContext.destination);
-          processorRef.current = processor;
+        try {
+          ws.send(JSON.stringify({ type: "start" }));
+          voiceStartingRef.current = false;
+          setAsrStatus("录音中");
+          setListening(true);
+          if (audioContext.audioWorklet) {
+            await audioContext.audioWorklet.addModule("/audio-recorder-worklet.js");
+            const node = new AudioWorkletNode(audioContext, "workbook-audio-recorder");
+            node.port.onmessage = (event: MessageEvent<Float32Array>) => sendSamples(event.data);
+            source.connect(node);
+            node.connect(audioContext.destination);
+            workletNodeRef.current = node;
+          } else {
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processor.onaudioprocess = (event) => sendSamples(event.inputBuffer.getChannelData(0));
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+            processorRef.current = processor;
+          }
+        } catch (error) {
+          setAsrStatus(error instanceof Error ? error.message : "无法启动录音处理");
+          closeVoiceSession(false);
         }
       };
       ws.onmessage = (message) => {
@@ -1137,21 +1171,22 @@ function CollectView(props: {
       };
       ws.onerror = () => setAsrStatus("语音连接失败");
       ws.onclose = () => {
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+        voiceStartingRef.current = false;
         stopAudio();
         setListening(false);
       };
     } catch (error) {
-      stopAudio();
-      setListening(false);
+      closeVoiceSession(false);
       setAsrStatus(error instanceof Error ? error.message : "无法开始录音");
     }
   }
 
   function stopVoice() {
-    wsRef.current?.send(JSON.stringify({ type: "stop" }));
-    window.setTimeout(() => wsRef.current?.close(), 600);
-    stopAudio();
-    setListening(false);
+    setAsrStatus("正在结束录音");
+    closeVoiceSession(true);
   }
 
   async function setSubmission(studentId: string, status: "submitted" | "missing" | "pending_confirm", source = "manual") {

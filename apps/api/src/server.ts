@@ -63,6 +63,7 @@ const server =
       )
     : http.createServer(app);
 const asrWss = new WebSocketServer({ noServer: true });
+const activeAsrClients = new Set<WebSocket>();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
 dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: false });
@@ -75,6 +76,7 @@ const secureCookies = process.env.COOKIE_SECURE
   : webOrigin.startsWith("https://");
 const asrProvider = (process.env.ASR_PROVIDER ?? "disabled") as AsrProvider;
 const asrMockText = process.env.ASR_MOCK_TEXT ?? "张三";
+const maxAsrConcurrency = Number(process.env.ASR_MAX_CONCURRENCY ?? 1);
 const defaultVolcengineAsrEndpoint = "wss://openspeech.bytedance.com/api/v2/asr";
 
 const volcengineProtocolVersion = 0x1;
@@ -496,6 +498,13 @@ function parseVolcengineResponse(message: RawData) {
     error: rawPayload,
     code
   };
+}
+
+function formatVolcengineAsrError(code: number | undefined, error: string) {
+  if (code === 45000292 || /quota exceeded|concurrency/i.test(error)) {
+    return "火山引擎流式识别并发额度已用完，请等待上一段录音释放后再试；如果仍然出现，需要在火山控制台提升流式识别并发额度。";
+  }
+  return `火山引擎 ASR 错误${code ? ` ${code}` : ""}：${error}`;
 }
 
 function ensureClass(_currentTeacherId: string, gradeId: string, classId: string) {
@@ -968,10 +977,12 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   let started = false;
 
   function closeUpstream() {
-    if (upstream && upstream.readyState === WebSocket.OPEN) {
-      upstream.close();
-    }
+    const socket = upstream;
     upstream = null;
+    if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
+      socket.close();
+    }
+    activeAsrClients.delete(ws);
   }
 
   function handleFinalText(text: string) {
@@ -1039,7 +1050,8 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
       try {
         const response = parseVolcengineResponse(message);
         if (response.type === "error") {
-          sendAsr(ws, { type: "error", message: `火山引擎 ASR 错误${response.code ? ` ${response.code}` : ""}：${response.error}` });
+          sendAsr(ws, { type: "error", message: formatVolcengineAsrError(response.code, response.error) });
+          closeUpstream();
           return;
         }
         if (response.text && response.type === "final") {
@@ -1057,6 +1069,10 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
     });
 
     providerSocket.on("close", (code, reason) => {
+      if (upstream === providerSocket) {
+        upstream = null;
+      }
+      activeAsrClients.delete(ws);
       if (ws.readyState === WebSocket.OPEN) {
         const detail = reason.length ? `，原因：${reason.toString()}` : "";
         sendAsr(ws, { type: "status", message: `火山引擎 ASR 连接已关闭：${code}${detail}` });
@@ -1099,7 +1115,17 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
         return;
       }
       if (asrProvider === "volcengine") {
+        if (activeAsrClients.size >= maxAsrConcurrency) {
+          sendAsr(ws, { type: "error", message: "当前已有录音识别正在进行，请先结束上一段录音，等待几秒后再开始。" });
+          ws.close(1013, "ASR concurrency limit");
+          return;
+        }
+        activeAsrClients.add(ws);
         upstream = connectVolcengine();
+        if (!upstream) {
+          activeAsrClients.delete(ws);
+          ws.close(1011, "ASR upstream unavailable");
+        }
       }
       return;
     }
@@ -1122,6 +1148,7 @@ asrWss.on("connection", (ws: WebSocket, req: AsrUpgradeRequest) => {
   });
 
   ws.on("close", closeUpstream);
+  ws.on("error", closeUpstream);
 });
 
 app.use((error: unknown, _req: Request, res: Response<ApiEnvelope<never>>, _next: NextFunction) => {
