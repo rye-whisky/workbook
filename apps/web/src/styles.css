@@ -406,7 +406,8 @@ select:focus {
 }
 
 .register-scroll {
-  overflow-x: auto;
+  max-height: min(62vh, 560px);
+  overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--paper-strong);
@@ -414,8 +415,8 @@ select:focus {
 }
 
 .register-table {
-  width: max-content;
-  min-width: 100%;
+  width: auto;
+  min-width: max-content;
   border-collapse: separate;
   border-spacing: 0;
   font-size: 13px;
@@ -443,8 +444,9 @@ select:focus {
   position: sticky;
   left: 0;
   z-index: 2;
-  min-width: 92px;
-  max-width: 120px;
+  width: 112px;
+  min-width: 112px;
+  max-width: 112px;
   background: #fffaf0;
   text-align: left;
   font-weight: 900;
@@ -746,6 +748,7 @@ select:focus {
 
 .bottom-nav {
   position: fixed;
+  z-index: 20;
   left: 50%;
   bottom: 0;
   transform: translateX(-50%);
