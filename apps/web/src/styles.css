@@ -76,7 +76,8 @@ select:focus {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 18px;
+  min-height: 42px;
+  margin-bottom: 10px;
 }
 
 .topbar h1,
@@ -191,6 +192,13 @@ select:focus {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 8px;
+}
+
+.student-library-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 1.4fr);
+  gap: 12px;
+  align-items: end;
 }
 
 .primary-button,
@@ -458,6 +466,23 @@ select:focus {
   text-align: center;
 }
 
+.register-table .register-row-label {
+  width: 64px;
+  min-width: 64px;
+  max-width: 64px;
+  background: #eadcc2;
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.register-table tbody .register-row-label {
+  background: #fffaf0;
+}
+
+.register-row-spacer {
+  color: transparent;
+}
+
 .register-status {
   font-size: 18px;
   font-weight: 900;
@@ -610,7 +635,15 @@ select:focus {
 }
 
 .task-form {
-  grid-template-columns: 1fr 110px 136px;
+  grid-template-columns: minmax(0, 1fr) 150px;
+}
+
+.task-subject-note {
+  align-self: center;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .task-form .primary-button {
@@ -794,7 +827,8 @@ select:focus {
   }
 
   .compact-form,
-  .task-form {
+  .task-form,
+  .student-library-controls {
     grid-template-columns: 1fr 1fr;
   }
 
@@ -821,7 +855,9 @@ select:focus {
 
   .voice-dock,
   .import-band,
-  .review-row {
+  .review-row,
+  .student-library-controls,
+  .task-form {
     grid-template-columns: 1fr;
   }
 

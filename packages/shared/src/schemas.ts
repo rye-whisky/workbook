@@ -36,7 +36,7 @@ export const studentOrderSchema = z.object({
 
 export const homeworkTaskSchema = z.object({
   title: z.string().trim().min(1),
-  subjectId: z.string().min(1),
+  subjectId: z.string().min(1).optional(),
   gradeId: z.string().min(1),
   classId: z.string().min(1),
   dueDate: z.string().trim().min(1),

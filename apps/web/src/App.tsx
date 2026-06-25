@@ -293,8 +293,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <span className="eyebrow">Workbook</span>
-          <h1>{teacher.name}的作业台</h1>
+          <span className="eyebrow">Workbook</span>
         </div>
         <button
           className="icon-button"
@@ -581,12 +580,12 @@ function StudentsView(props: {
   const [importRows, setImportRows] = useState<ImportRow[]>([]);
   const [importBatchId, setImportBatchId] = useState("");
   const [duplicateStrategy, setDuplicateStrategy] = useState<"skip" | "overwrite">("skip");
-  const [gradeName, setGradeName] = useState("");
   const [className, setClassName] = useState("");
   const [classGradeId, setClassGradeId] = useState(props.data.grades[0]?.id ?? "");
   const [register, setRegister] = useState<HomeworkRegister | null>(null);
   const [registerLoading, setRegisterLoading] = useState(false);
   const selectedClass = props.data.classrooms.find((classroom) => classroom.id === props.selectedClassId);
+  const gradeClassrooms = props.data.classrooms.filter((classroom) => classroom.gradeId === classGradeId);
   const classStudents = props.data.students.filter((student) => student.classId === props.selectedClassId);
   const students = classStudents.filter((student) => !query || student.name.includes(query));
   const registerCellMap = useMemo(
@@ -629,7 +628,7 @@ function StudentsView(props: {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${selectedClass.grade?.name ?? ""}${selectedClass.name}作业登记表.xlsx`;
+    link.download = `${selectedClass.grade?.name ?? ""}${selectedClass.name}\u4f5c\u4e1a\u767b\u8bb0\u8868.xlsx`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -706,118 +705,93 @@ function StudentsView(props: {
     <section className="screen-stack">
       <section className="section-block">
         <div className="section-heading">
-          <h3>年级与班级</h3>
-          <span className="count-badge ink">{props.data.classrooms.length}</span>
+          <h3>{"\u5e74\u7ea7\u4e0e\u73ed\u7ea7"}</h3>
+          <span className="count-badge ink">{gradeClassrooms.length}</span>
         </div>
-        <form
-          className="compact-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!gradeName.trim()) return;
-            props.onAction(async () => {
-              await api("/api/grades", { method: "POST", body: JSON.stringify({ name: gradeName.trim() }) });
-              setGradeName("");
-              await props.onRefresh();
-            }, "年级已创建");
-          }}
-        >
-          <input value={gradeName} placeholder="新增年级，例如：九年级" onChange={(event) => setGradeName(event.target.value)} />
-          <button className="icon-text-button" disabled={props.busy}>
-            <Plus size={17} />
-            年级
-          </button>
-        </form>
-        <form
-          className="compact-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!className.trim() || !classGradeId) return;
-            props.onAction(async () => {
-              await api("/api/classes", { method: "POST", body: JSON.stringify({ name: className.trim(), gradeId: classGradeId }) });
-              setClassName("");
-              await props.onRefresh();
-            }, "班级已创建");
-          }}
-        >
-          <select value={classGradeId} onChange={(event) => setClassGradeId(event.target.value)}>
-            {props.data.grades.map((grade) => (
-              <option value={grade.id} key={grade.id}>
-                {grade.name}
-              </option>
-            ))}
-          </select>
-          <input value={className} placeholder="新增班级，例如：1班" onChange={(event) => setClassName(event.target.value)} />
-          <button className="icon-text-button" disabled={props.busy || props.data.grades.length === 0}>
-            <Plus size={17} />
-            班级
-          </button>
-        </form>
+        <div className="student-library-controls">
+          <label className="field-label">
+            {"\u9009\u62e9\u5e74\u7ea7"}
+            <select value={classGradeId} onChange={(event) => setClassGradeId(event.target.value)}>
+              {props.data.grades.map((grade) => (
+                <option value={grade.id} key={grade.id}>
+                  {grade.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <form
+            className="compact-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!className.trim() || !classGradeId) return;
+              props.onAction(async () => {
+                await api("/api/classes", { method: "POST", body: JSON.stringify({ name: className.trim(), gradeId: classGradeId }) });
+                setClassName("");
+                await props.onRefresh();
+              }, "\u73ed\u7ea7\u5df2\u521b\u5efa");
+            }}
+          >
+            <input value={className} placeholder="\u65b0\u589e\u73ed\u7ea7\uff0c\u4f8b\u5982\uff1a1\u73ed" onChange={(event) => setClassName(event.target.value)} />
+            <button className="icon-text-button" disabled={props.busy || !classGradeId}>
+              <Plus size={17} />
+              {"\u73ed\u7ea7"}
+            </button>
+          </form>
+        </div>
         <div className="pill-list">
-          {props.data.grades.map((grade) => (
-            <span className="pill" key={grade.id}>
-              {grade.name}
-              <button
-                title="编辑年级"
-                onClick={() => {
-                  const nextName = window.prompt("年级名称", grade.name);
-                  if (!nextName) return;
-                  props.onAction(async () => {
-                    await api(`/api/grades/${grade.id}`, { method: "PATCH", body: JSON.stringify({ name: nextName }) });
-                    await props.onRefresh();
-                  }, "年级已更新");
-                }}
-              >
-                <RefreshCcw size={12} />
-              </button>
-              <button
-                title="删除年级"
-                onClick={() => {
-                  if (!window.confirm(`删除 ${grade.name}？年级下仍有班级时会被拒绝。`)) return;
-                  props.onAction(async () => {
-                    await api(`/api/grades/${grade.id}`, { method: "DELETE" });
-                    await props.onRefresh();
-                  }, "年级已删除");
-                }}
-              >
-                <Trash2 size={12} />
-              </button>
-            </span>
-          ))}
-          {props.data.classrooms.map((classroom) => (
+          {gradeClassrooms.length === 0 ? <span className="section-subtitle">{"\u5f53\u524d\u5e74\u7ea7\u8fd8\u6ca1\u6709\u73ed\u7ea7"}</span> : null}
+          {gradeClassrooms.map((classroom) => (
             <span className="pill" key={classroom.id}>
-              {classroom.grade?.name}{classroom.name}
+              {classroom.grade?.name}
+              {classroom.name}
               <button
-                title="编辑班级"
+                type="button"
+                title="\u4fee\u6539\u73ed\u7ea7\u540d\u79f0"
                 onClick={() => {
-                  const nextName = window.prompt("班级名称", classroom.name);
+                  const nextName = window.prompt("\u73ed\u7ea7\u540d\u79f0", classroom.name);
                   if (!nextName) return;
                   props.onAction(async () => {
-                    await api(`/api/classes/${classroom.id}`, {
-                      method: "PATCH",
-                      body: JSON.stringify({ name: nextName, gradeId: classroom.gradeId })
-                    });
+                    await api("/api/classes/" + classroom.id, { method: "PATCH", body: JSON.stringify({ name: nextName, gradeId: classroom.gradeId }) });
                     await props.onRefresh();
-                  }, "班级已更新");
+                  }, "\u73ed\u7ea7\u5df2\u66f4\u65b0");
                 }}
               >
-                <RefreshCcw size={12} />
+                <RefreshCcw size={14} />
               </button>
               <button
-                title="删除班级"
+                type="button"
+                title="\u8c03\u6574\u6240\u5c5e\u5e74\u7ea7"
                 onClick={() => {
-                  if (!window.confirm(`删除 ${classroom.grade?.name}${classroom.name}？历史作业会保留。`)) return;
+                  const nextGradeName = window.prompt("\u5e74\u7ea7\u540d\u79f0", classroom.grade?.name ?? "");
+                  if (!nextGradeName) return;
+                  const nextGrade = props.data.grades.find((grade) => grade.name === nextGradeName.trim());
+                  if (!nextGrade) {
+                    window.alert("\u672a\u627e\u5230\u8fd9\u4e2a\u5e74\u7ea7");
+                    return;
+                  }
                   props.onAction(async () => {
-                    await api(`/api/classes/${classroom.id}`, { method: "DELETE" });
+                    await api("/api/classes/" + classroom.id, { method: "PATCH", body: JSON.stringify({ name: classroom.name, gradeId: nextGrade.id }) });
                     await props.onRefresh();
-                  }, "班级已删除");
+                  }, "\u73ed\u7ea7\u6240\u5c5e\u5e74\u7ea7\u5df2\u66f4\u65b0");
                 }}
               >
-                <Trash2 size={12} />
+                <School size={14} />
+              </button>
+              <button
+                type="button"
+                title="\u5220\u9664\u73ed\u7ea7"
+                onClick={() => props.onAction(async () => {
+                  await api("/api/classes/" + classroom.id, { method: "DELETE" });
+                  await props.onRefresh();
+                }, "\u73ed\u7ea7\u5df2\u9690\u85cf")}
+              >
+                <Trash2 size={14} />
               </button>
             </span>
           ))}
         </div>
       </section>
+
       <ClassSelect classes={props.data.classrooms} value={props.selectedClassId} onChange={props.onClassChange} />
 
       <section className="section-block register-section">
@@ -842,12 +816,14 @@ function StudentsView(props: {
               <thead>
                 <tr>
                   <th className="sticky-name" rowSpan={2}>{"\u59d3\u540d"}</th>
+                  <th className="register-row-label">{"\u65f6\u95f4"}</th>
                   {register.tasks.length === 0 ? <th>{"\u6682\u65e0\u4f5c\u4e1a"}</th> : null}
                   {register.tasks.map((task) => (
                     <th key={"date-" + task.id}>{formatDate(task.dueDate)}</th>
                   ))}
                 </tr>
                 <tr>
+                  <th className="register-row-label">{"\u9879\u76ee"}</th>
                   {register.tasks.length === 0 ? <th>{"\u521b\u5efa\u4f5c\u4e1a\u540e\u81ea\u52a8\u751f\u6210\u5217"}</th> : null}
                   {register.tasks.map((task) => (
                     <th key={"title-" + task.id}>{task.title}</th>
@@ -858,6 +834,7 @@ function StudentsView(props: {
                 {register.students.map((student) => (
                   <tr key={student.id}>
                     <th className="sticky-name">{student.name}</th>
+                    <td className="register-row-label register-row-spacer"></td>
                     {register.tasks.length === 0 ? <td className="register-empty-cell">-</td> : null}
                     {register.tasks.map((task) => {
                       const cell = registerCellMap.get(task.id + ":" + student.id);
@@ -1001,19 +978,17 @@ function TasksView(props: {
   const selectedClass = props.data.classrooms.find((classroom) => classroom.id === props.selectedClassId);
   const [form, setForm] = useState({
     title: "",
-    subjectId: props.data.subjects[0]?.id ?? "",
     dueDate: toInputDate()
   });
 
   async function createTask(event: FormEvent) {
     event.preventDefault();
-    if (!selectedClass) return;
+    if (!selectedClass || !form.title.trim()) return;
     await props.onAction(async () => {
       const task = await api<HomeworkTask>("/api/homework-tasks", {
         method: "POST",
         body: JSON.stringify({
           title: form.title,
-          subjectId: form.subjectId,
           gradeId: selectedClass.gradeId,
           classId: selectedClass.id,
           dueDate: form.dueDate,
@@ -1030,17 +1005,13 @@ function TasksView(props: {
     <section className="screen-stack">
       <ClassSelect classes={props.data.classrooms} value={props.selectedClassId} onChange={props.onClassChange} />
       <form className="task-form" onSubmit={createTask}>
-        <input placeholder="作业标题" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
-        <select value={form.subjectId} onChange={(event) => setForm({ ...form, subjectId: event.target.value })}>
-          {props.data.subjects.map((subject) => (
-            <option value={subject.id} key={subject.id}>
-              {subject.name}
-            </option>
-          ))}
-        </select>
+        <input placeholder="\u4f5c\u4e1a\u6807\u9898" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
         <input type="date" value={form.dueDate} onChange={(event) => setForm({ ...form, dueDate: event.target.value })} />
-        <button className="primary-button" disabled={props.busy || !form.subjectId}>
-          创建作业
+        <p className="task-subject-note">
+          {"\u5b66\u79d1\uff1a"}{props.data.subjects[0]?.name ?? "\u8bf7\u5148\u5230\u8bbe\u7f6e\u8865\u5145\u5b66\u79d1"}
+        </p>
+        <button className="primary-button" disabled={props.busy || !props.data.subjects.length || !selectedClass || !form.title.trim()}>
+          {"\u521b\u5efa\u4f5c\u4e1a"}
         </button>
       </form>
       <section className="task-list">
@@ -1552,37 +1523,12 @@ function SettingsView(props: {
   onAction: (action: () => Promise<void>, success?: string) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
-  const [gradeName, setGradeName] = useState("");
   const [className, setClassName] = useState("");
   const [classGradeId, setClassGradeId] = useState(props.data.grades[0]?.id ?? "");
   const [subjectName, setSubjectName] = useState("");
 
   return (
     <section className="screen-stack">
-      <section className="section-block">
-        <div className="section-heading">
-          <h3>年级</h3>
-        </div>
-        <form
-          className="compact-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            props.onAction(async () => {
-              await api("/api/grades", { method: "POST", body: JSON.stringify({ name: gradeName }) });
-              setGradeName("");
-              await props.onRefresh();
-            }, "年级已创建");
-          }}
-        >
-          <input value={gradeName} placeholder="例如：七年级" onChange={(event) => setGradeName(event.target.value)} />
-          <button className="icon-text-button" disabled={props.busy}>
-            <Plus size={17} />
-            新增
-          </button>
-        </form>
-        <PillList items={props.data.grades} endpoint="/api/grades" onAction={props.onAction} onRefresh={props.onRefresh} />
-      </section>
-
       <section className="section-block">
         <div className="section-heading">
           <h3>班级</h3>

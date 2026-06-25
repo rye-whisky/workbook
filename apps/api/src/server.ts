@@ -127,6 +127,7 @@ async function withOcrSlot<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 const defaultVolcengineAsrEndpoint = "wss://openspeech.bytedance.com/api/v2/asr";
+const FIXED_GRADE_NAMES = ["一年级", "二年级", "三年级", "四年级", "五年级", "六年级", "七年级", "八年级", "九年级"];
 
 const volcengineProtocolVersion = 0x1;
 const volcengineHeaderSize = 0x1;
@@ -318,11 +319,56 @@ function camelStudent(row: Row) {
 }
 
 function getGrades() {
-  return all("SELECT * FROM grades WHERE deleted_at IS NULL ORDER BY name").map(camelGrade);
+  return all(
+    `SELECT *
+     FROM grades
+     WHERE deleted_at IS NULL
+     ORDER BY CASE name
+       WHEN '一年级' THEN 1
+       WHEN '二年级' THEN 2
+       WHEN '三年级' THEN 3
+       WHEN '四年级' THEN 4
+       WHEN '五年级' THEN 5
+       WHEN '六年级' THEN 6
+       WHEN '七年级' THEN 7
+       WHEN '八年级' THEN 8
+       WHEN '九年级' THEN 9
+       ELSE 99
+     END, name`
+  ).map(camelGrade);
 }
 
 function getSubjects(currentTeacherId: string) {
   return all("SELECT * FROM subjects WHERE teacher_id = ? ORDER BY name", currentTeacherId).map(camelSubject);
+}
+
+function ensureFixedGrades(ownerTeacherId: string) {
+  const timestamp = nowIso();
+  for (const name of FIXED_GRADE_NAMES) {
+    const active = one("SELECT id FROM grades WHERE name = ? AND deleted_at IS NULL", name);
+    if (active) continue;
+    const deleted = one("SELECT id FROM grades WHERE name = ? ORDER BY updated_at DESC LIMIT 1", name);
+    if (deleted) {
+      run("UPDATE grades SET deleted_at = NULL, updated_at = ? WHERE id = ?", timestamp, String(deleted.id));
+      continue;
+    }
+    run("INSERT INTO grades (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, ownerTeacherId, timestamp, timestamp);
+  }
+}
+
+function resolveSubjectId(currentTeacherId: string, requestedSubjectId?: string) {
+  if (requestedSubjectId) {
+    const subject = one("SELECT id FROM subjects WHERE id = ? AND teacher_id = ?", requestedSubjectId, currentTeacherId);
+    if (!subject) {
+      throw notFound("学科不存在或无权访问");
+    }
+    return requestedSubjectId;
+  }
+  const defaultSubject = one("SELECT id FROM subjects WHERE teacher_id = ? ORDER BY created_at ASC, name ASC LIMIT 1", currentTeacherId);
+  if (!defaultSubject) {
+    throw new ApiError(400, "当前教师还没有学科，请先在设置中添加学科");
+  }
+  return String(defaultSubject.id);
 }
 
 function getClasses() {
@@ -331,7 +377,18 @@ function getClasses() {
      FROM classrooms c
      JOIN grades g ON g.id = c.grade_id
      WHERE c.deleted_at IS NULL AND g.deleted_at IS NULL
-     ORDER BY g.name, c.name`
+     ORDER BY CASE g.name
+       WHEN '一年级' THEN 1
+       WHEN '二年级' THEN 2
+       WHEN '三年级' THEN 3
+       WHEN '四年级' THEN 4
+       WHEN '五年级' THEN 5
+       WHEN '六年级' THEN 6
+       WHEN '七年级' THEN 7
+       WHEN '八年级' THEN 8
+       WHEN '九年级' THEN 9
+       ELSE 99
+     END, c.name`
   ).map(camelClass);
 }
 
@@ -516,15 +573,17 @@ async function buildHomeworkRegisterWorkbook(register: HomeworkRegister) {
   workbook.created = new Date();
   const sheetName = safeSheetName(`${register.grade.name}${register.classroom.name}`);
   const worksheet = workbook.addWorksheet(sheetName);
-  const totalColumns = Math.max(2, register.tasks.length + 1);
+  const totalColumns = Math.max(3, register.tasks.length + 2);
   worksheet.mergeCells(1, 1, 1, totalColumns);
   worksheet.getCell(1, 1).value = `${register.grade.name}${register.classroom.name}作业登记表`;
   worksheet.getCell(1, 1).alignment = { horizontal: "center", vertical: "middle" };
   worksheet.getCell(1, 1).font = { name: "宋体", size: 16, bold: true };
+  worksheet.mergeCells(2, 1, 3, 1);
   worksheet.getCell(2, 1).value = "姓名";
-  worksheet.getCell(3, 1).value = "";
+  worksheet.getCell(2, 2).value = "时间";
+  worksheet.getCell(3, 2).value = "项目";
   register.tasks.forEach((task, index) => {
-    const column = index + 2;
+    const column = index + 3;
     worksheet.getCell(2, column).value = shortDate(task.dueDate);
     worksheet.getCell(3, column).value = task.title;
   });
@@ -532,8 +591,9 @@ async function buildHomeworkRegisterWorkbook(register: HomeworkRegister) {
   register.students.forEach((student, studentIndex) => {
     const rowNumber = studentIndex + 4;
     worksheet.getCell(rowNumber, 1).value = student.name;
+    worksheet.getCell(rowNumber, 2).value = "";
     register.tasks.forEach((task, taskIndex) => {
-      const column = taskIndex + 2;
+      const column = taskIndex + 3;
       const registerCell = cellByKey.get(`${task.id}:${student.id}`);
       const worksheetCell = worksheet.getCell(rowNumber, column);
       worksheetCell.value = registerCell?.symbol ?? "×";
@@ -544,9 +604,10 @@ async function buildHomeworkRegisterWorkbook(register: HomeworkRegister) {
   });
   worksheet.columns = [
     { width: 12 },
+    { width: 8 },
     ...register.tasks.map(() => ({ width: 12 }))
   ];
-  worksheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3 }];
+  worksheet.views = [{ state: "frozen", xSplit: 2, ySplit: 3 }];
   for (let row = 1; row <= register.students.length + 3; row += 1) {
     for (let column = 1; column <= totalColumns; column += 1) {
       const cell = worksheet.getCell(row, column);
@@ -829,6 +890,7 @@ app.post("/api/auth/register", authLimiter, async (req, res, next) => {
       for (const name of new Set([...DEFAULT_SUBJECTS, input.subjectName])) {
         run("INSERT OR IGNORE INTO subjects (id, name, teacher_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", createId(), name, id, timestamp, timestamp);
       }
+      ensureFixedGrades(id);
       return one("SELECT id, username, name FROM teachers WHERE id = ?", id);
     });
     if (!created) throw new Error("账号创建失败");
@@ -870,6 +932,7 @@ app.get("/api/auth/me", requireAuth, (req: AuthRequest, res, next) => {
 app.get("/api/bootstrap", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const currentTeacherId = teacherId(req);
+    ensureFixedGrades(currentTeacherId);
     return ok(res, {
       grades: getGrades(),
       classrooms: getClasses(),
@@ -882,7 +945,10 @@ app.get("/api/bootstrap", requireAuth, (req: AuthRequest, res, next) => {
   }
 });
 
-app.get("/api/grades", requireAuth, (_req: AuthRequest, res) => ok(res, getGrades()));
+app.get("/api/grades", requireAuth, (req: AuthRequest, res) => {
+  ensureFixedGrades(teacherId(req));
+  return ok(res, getGrades());
+});
 app.post("/api/grades", requireAuth, (req: AuthRequest, res, next) => {
   try {
     const input = namedEntitySchema.parse(req.body);
@@ -1091,15 +1157,13 @@ app.post("/api/homework-tasks", requireAuth, (req: AuthRequest, res, next) => {
     const input = homeworkTaskSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     ensureClass(input.gradeId, input.classId);
-    if (!one("SELECT id FROM subjects WHERE id = ? AND teacher_id = ?", input.subjectId, currentTeacherId)) {
-      throw notFound("学科不存在或无权访问");
-    }
+    const subjectId = resolveSubjectId(currentTeacherId, input.subjectId);
     const taskId = withTransaction(() => {
       const id = createId();
       const timestamp = nowIso();
       const grade = one("SELECT name FROM grades WHERE id = ?", input.gradeId);
       const classroom = one("SELECT name FROM classrooms WHERE id = ?", input.classId);
-      const subject = one("SELECT name FROM subjects WHERE id = ?", input.subjectId);
+      const subject = one("SELECT name FROM subjects WHERE id = ?", subjectId);
       run(
         "INSERT INTO homework_tasks (id, title, due_date, status, teacher_id, subject_id, grade_id, class_id, grade_name_snapshot, class_name_snapshot, subject_name_snapshot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         id,
@@ -1107,7 +1171,7 @@ app.post("/api/homework-tasks", requireAuth, (req: AuthRequest, res, next) => {
         parseDate(input.dueDate),
         input.status,
         currentTeacherId,
-        input.subjectId,
+        subjectId,
         input.gradeId,
         input.classId,
         grade ? String(grade.name) : null,
@@ -1139,15 +1203,18 @@ app.patch("/api/homework-tasks/:id", requireAuth, (req: AuthRequest, res, next) 
     const input = homeworkTaskSchema.parse(req.body);
     const currentTeacherId = teacherId(req);
     ensureClass(input.gradeId, input.classId);
+    const existingTask = one("SELECT subject_id FROM homework_tasks WHERE id = ? AND teacher_id = ?", routeParam(req, "id"), currentTeacherId);
+    if (!existingTask) throw notFound("作业任务不存在或无权访问");
+    const subjectId = resolveSubjectId(currentTeacherId, input.subjectId ?? String(existingTask.subject_id));
     const grade = one("SELECT name FROM grades WHERE id = ?", input.gradeId);
     const classroom = one("SELECT name FROM classrooms WHERE id = ?", input.classId);
-    const subject = one("SELECT name FROM subjects WHERE id = ?", input.subjectId);
+    const subject = one("SELECT name FROM subjects WHERE id = ?", subjectId);
     run(
       "UPDATE homework_tasks SET title = ?, due_date = ?, status = ?, subject_id = ?, grade_id = ?, class_id = ?, grade_name_snapshot = ?, class_name_snapshot = ?, subject_name_snapshot = ?, updated_at = ? WHERE id = ? AND teacher_id = ?",
       input.title,
       parseDate(input.dueDate),
       input.status,
-      input.subjectId,
+      subjectId,
       input.gradeId,
       input.classId,
       grade ? String(grade.name) : null,
