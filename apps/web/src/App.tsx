@@ -833,8 +833,7 @@ function StudentsView(props: {
               <tbody>
                 {register.students.map((student) => (
                   <tr key={student.id}>
-                    <th className="sticky-name">{student.name}</th>
-                    <td className="register-row-label register-row-spacer"></td>
+                    <th className="sticky-name register-student-name" colSpan={2}>{student.name}</th>
                     {register.tasks.length === 0 ? <td className="register-empty-cell">-</td> : null}
                     {register.tasks.map((task) => {
                       const cell = registerCellMap.get(task.id + ":" + student.id);

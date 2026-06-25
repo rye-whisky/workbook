@@ -590,8 +590,8 @@ async function buildHomeworkRegisterWorkbook(register: HomeworkRegister) {
   const cellByKey = new Map(register.cells.map((cell) => [`${cell.taskId}:${cell.studentId}`, cell]));
   register.students.forEach((student, studentIndex) => {
     const rowNumber = studentIndex + 4;
+    worksheet.mergeCells(rowNumber, 1, rowNumber, 2);
     worksheet.getCell(rowNumber, 1).value = student.name;
-    worksheet.getCell(rowNumber, 2).value = "";
     register.tasks.forEach((task, taskIndex) => {
       const column = taskIndex + 3;
       const registerCell = cellByKey.get(`${task.id}:${student.id}`);
