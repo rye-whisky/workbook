@@ -1495,7 +1495,7 @@ function SubmissionGroup(props: {
         <div className="submission-row" key={submission.id}>
           <div>
             <strong>{submission.student.name}</strong>
-            <span>{statusLabel(submission.status)} {"\u00b7"} {submission.source}</span>
+            <span>{statusLabel(submission.status)}</span>
           </div>
           <div className="row-actions status-actions">
             <button className="icon-button small good" title={"\u6807\u8bb0\u5df2\u4ea4"} disabled={submission.status === "submitted"} onClick={() => props.onSet(submission.student.id, "submitted")}>

@@ -18,7 +18,9 @@
   --shadow: 0 18px 48px rgba(67, 58, 41, 0.14);
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
@@ -113,11 +115,14 @@ select:focus {
 .main-panel {
   border-radius: 12px;
   padding: 14px;
+  overflow: hidden;
 }
 
 .screen-stack {
   display: grid;
   gap: 14px;
+  width: 100%;
+  min-width: 0;
 }
 
 .auth-page {
@@ -376,6 +381,8 @@ select:focus {
 .section-block {
   border-radius: 12px;
   padding: 14px;
+  width: 100%;
+  min-width: 0;
 }
 
 .section-heading {
@@ -414,6 +421,8 @@ select:focus {
 }
 
 .register-scroll {
+  width: 100%;
+  max-width: 100%;
   max-height: min(62vh, 560px);
   overflow: auto;
   border: 1px solid var(--line);
@@ -587,8 +596,25 @@ select:focus {
 }
 
 .status-actions {
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.submission-row > div:first-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.submission-row .row-actions {
+  gap: 5px;
+}
+
+.submission-row .icon-button.small,
+.submission-row .status-action {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
 }
 
 .status-action {
@@ -869,5 +895,14 @@ select:focus {
   .row-actions,
   .candidate-list {
     justify-content: flex-start;
+  }
+
+  .submission-row {
+    align-items: center;
+    gap: 8px;
+  }
+
+  .submission-row .row-actions {
+    justify-content: flex-end;
   }
 }
