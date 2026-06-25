@@ -793,7 +793,7 @@ function StudentsView(props: {
               }, "\u73ed\u7ea7\u5df2\u521b\u5efa");
             }}
           >
-            <input value={className} placeholder="\u65b0\u589e\u73ed\u7ea7\uff0c\u4f8b\u5982\uff1a1\u73ed" onChange={(event) => setClassName(event.target.value)} />
+            <input value={className} placeholder={"\u65b0\u589e\u73ed\u7ea7\uff0c\u4f8b\u5982\uff1a1\u73ed"} onChange={(event) => setClassName(event.target.value)} />
             <button className="icon-text-button" disabled={props.busy || !classGradeId}>
               <Plus size={17} />
               {"\u73ed\u7ea7"}
@@ -808,7 +808,7 @@ function StudentsView(props: {
               {classroom.name}
               <button
                 type="button"
-                title="\u4fee\u6539\u73ed\u7ea7\u540d\u79f0"
+                title={"\u4fee\u6539\u73ed\u7ea7\u540d\u79f0"}
                 onClick={() => {
                   const nextName = window.prompt("\u73ed\u7ea7\u540d\u79f0", classroom.name);
                   if (!nextName) return;
@@ -822,7 +822,7 @@ function StudentsView(props: {
               </button>
               <button
                 type="button"
-                title="\u8c03\u6574\u6240\u5c5e\u5e74\u7ea7"
+                title={"\u8c03\u6574\u6240\u5c5e\u5e74\u7ea7"}
                 onClick={() => {
                   const nextGradeName = window.prompt("\u5e74\u7ea7\u540d\u79f0", classroom.grade?.name ?? "");
                   if (!nextGradeName) return;
@@ -841,7 +841,7 @@ function StudentsView(props: {
               </button>
               <button
                 type="button"
-                title="\u5220\u9664\u73ed\u7ea7"
+                title={"\u5220\u9664\u73ed\u7ea7"}
                 onClick={() => props.onAction(async () => {
                   await api("/api/classes/" + classroom.id, { method: "DELETE" });
                   await props.onRefresh();
@@ -1066,7 +1066,7 @@ function TasksView(props: {
     <section className="screen-stack">
       <ClassSelect classes={props.data.classrooms} value={props.selectedClassId} onChange={props.onClassChange} />
       <form className="task-form" onSubmit={createTask}>
-        <input placeholder="\u4f5c\u4e1a\u6807\u9898" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
+        <input placeholder={"\u4f5c\u4e1a\u6807\u9898"} value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
         <input type="date" value={form.dueDate} onChange={(event) => setForm({ ...form, dueDate: event.target.value })} />
         <p className="task-subject-note">
           {"\u5b66\u79d1\uff1a"}{props.data.subjects[0]?.name ?? "\u8bf7\u5148\u5230\u8bbe\u7f6e\u8865\u5145\u5b66\u79d1"}
