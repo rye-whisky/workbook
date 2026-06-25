@@ -326,6 +326,8 @@ export default function App() {
               setSelectedTaskId(taskId);
               setTab("collect");
             }}
+            onCreateTask={() => setTab("tasks")}
+            onOpenStudents={() => setTab("students")}
           />
         )}
 
@@ -516,18 +518,52 @@ function HomeView(props: {
   selectedTaskId: string;
   onClassChange: (id: string) => void;
   onTaskSelect: (id: string) => void;
+  onCreateTask: () => void;
+  onOpenStudents: () => void;
 }) {
-  const totalPending = props.openTasks.reduce((sum, task) => sum + task.stats.missing + task.stats.pending, 0);
+  const classOpenTasks = props.openTasks.filter((task) => task.classId === props.selectedClassId);
+  const missingTotal = classOpenTasks.reduce((sum, task) => sum + task.stats.missing, 0);
+  const pendingTotal = classOpenTasks.reduce((sum, task) => sum + task.stats.pending, 0);
+  const totalPending = missingTotal + pendingTotal;
+  const pendingTaskCount = classOpenTasks.filter((task) => task.stats.missing + task.stats.pending > 0).length;
+  const today = toInputDate();
+  const todaySubmittedTotal = classOpenTasks
+    .filter((task) => toInputDate(task.dueDate) === today)
+    .reduce((sum, task) => sum + task.stats.submitted + task.stats.lateSubmitted, 0);
+  const priorityTasks = [...classOpenTasks].sort((a, b) => {
+    const aNeed = a.stats.missing + a.stats.pending;
+    const bNeed = b.stats.missing + b.stats.pending;
+    if ((bNeed > 0 ? 1 : 0) !== (aNeed > 0 ? 1 : 0)) return (bNeed > 0 ? 1 : 0) - (aNeed > 0 ? 1 : 0);
+    if (b.stats.pending !== a.stats.pending) return b.stats.pending - a.stats.pending;
+    if (b.stats.missing !== a.stats.missing) return b.stats.missing - a.stats.missing;
+    return new Date(b.dueDate).getTime() - new Date(a.dueDate).getTime();
+  });
+  const primaryTask = priorityTasks[0];
+  const classLabel = props.activeClass ? (props.activeClass.grade?.name ?? "") + props.activeClass.name : "\u672a\u9009\u73ed\u7ea7";
+  const openPrimaryTask = () => {
+    if (primaryTask) {
+      props.onTaskSelect(primaryTask.id);
+      return;
+    }
+    props.onCreateTask();
+  };
+
   return (
     <section className="screen-stack">
-      <div className="hero-band">
+      <div className="hero-band workbench-hero">
         <div>
-          <span className="eyebrow">今日</span>
-          <h2>{totalPending} 人次待处理</h2>
+          <span className="eyebrow">{"\u4eca\u65e5\u5f85\u5904\u7406"}</span>
+          <h2>{totalPending} {"\u4eba\u6b21\u5f85\u5904\u7406"}</h2>
+          <p>{pendingTaskCount} {"\u4efd\u4f5c\u4e1a\u5f85\u6536\uff0c"}{missingTotal} {"\u4eba\u6b21\u672a\u4ea4\uff0c"}{pendingTotal} {"\u4eba\u6b21\u5f85\u786e\u8ba4"}</p>
         </div>
-        <div className="metric-pill">
-          <School size={18} />
-          <span>{props.activeClass ? `${props.activeClass.grade?.name}${props.activeClass.name}` : "未选班级"}</span>
+        <div className="hero-actions">
+          <div className="metric-pill">
+            <School size={18} />
+            <span>{classLabel}</span>
+          </div>
+          <button className="primary-button compact-primary" onClick={openPrimaryTask}>
+            {primaryTask ? "\u7ee7\u7eed\u6536\u4f5c\u4e1a" : "\u521b\u5efa\u4f5c\u4e1a"}
+          </button>
         </div>
       </div>
 
@@ -537,30 +573,56 @@ function HomeView(props: {
         onChange={props.onClassChange}
       />
 
-      <div className="stats-grid">
-        <Stat label="班级学生" value={props.classStudents.length} tone="ink" />
-        <Stat label="进行中" value={props.openTasks.length} tone="amber" />
-        <Stat label="未交待确" value={totalPending} tone="red" />
+      <div className="stats-grid workbench-stats">
+        <Stat label={"\u5f85\u6536\u4f5c\u4e1a"} value={classOpenTasks.length} tone="amber" />
+        <Stat label={"\u672a\u4ea4\u4eba\u6b21"} value={missingTotal} tone="red" />
+        <Stat label={"\u5f85\u786e\u8ba4"} value={pendingTotal} tone="amber" />
+        <Stat label={"\u4eca\u65e5\u5df2\u6536"} value={todaySubmittedTotal} tone="green" />
+      </div>
+
+      <div className="quick-actions">
+        <button onClick={props.onCreateTask}>
+          <ClipboardList size={18} />
+          <span>{"\u521b\u5efa\u4f5c\u4e1a"}</span>
+        </button>
+        <button onClick={openPrimaryTask}>
+          <Mic size={18} />
+          <span>{"\u6536\u4f5c\u4e1a"}</span>
+        </button>
+        <button onClick={props.onOpenStudents}>
+          <FileSpreadsheet size={18} />
+          <span>{"\u67e5\u770b\u767b\u8bb0\u8868"}</span>
+        </button>
       </div>
 
       <section className="section-block">
         <div className="section-heading">
-          <h3>最近作业</h3>
+          <h3>{"\u4f18\u5148\u5904\u7406"}</h3>
+          <span className="section-subtitle">{props.classStudents.length} {"\u540d\u5b66\u751f"}</span>
         </div>
         <div className="task-list">
-          {props.openTasks.length === 0 ? <Empty label="暂无进行中的作业" /> : null}
-          {props.openTasks.slice(0, 5).map((task) => (
-            <button className="task-row" key={task.id} onClick={() => props.onTaskSelect(task.id)}>
-              <div>
-                <strong>{task.title}</strong>
-                <span>{taskTitle(task)}</span>
-              </div>
-              <div className="row-stats">
-                <b>{task.stats.submitted}</b>
-                <small>/ {task.stats.total}</small>
-              </div>
-            </button>
-          ))}
+          {priorityTasks.length === 0 ? <Empty label={"\u5f53\u524d\u73ed\u7ea7\u6682\u65e0\u5f85\u6536\u4f5c\u4e1a"} /> : null}
+          {priorityTasks.slice(0, 5).map((task) => {
+            const taskNeed = task.stats.missing + task.stats.pending;
+            const completed = taskNeed === 0;
+            return (
+              <button className={cx("task-row", "priority-task-row", completed && "completed")} key={task.id} onClick={() => props.onTaskSelect(task.id)}>
+                <div>
+                  <strong>{task.title}</strong>
+                  <span>{formatDate(task.dueDate)} {"\u00b7"} {taskTitle(task)}</span>
+                  <em>
+                    {completed
+                      ? "\u5df2\u5b8c\u6210"
+                      : "\u672a\u4ea4 " + task.stats.missing + " \u00b7 \u5f85\u786e\u8ba4 " + task.stats.pending + " \u00b7 \u5df2\u4ea4 " + task.stats.submitted + "/" + task.stats.total}
+                  </em>
+                </div>
+                <div className="row-stats">
+                  <b>{task.stats.submitted}</b>
+                  <small>/ {task.stats.total}</small>
+                </div>
+              </button>
+            );
+          })}
         </div>
       </section>
     </section>
